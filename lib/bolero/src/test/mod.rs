@@ -71,23 +71,28 @@ impl TestEngine {
         self
     }
 
-    fn sub_dir<'a, D: Iterator<Item = &'a str>>(&self, dirs: D) -> PathBuf {
-        let mut fuzz_target_path = self
-            .location
-            .work_dir()
-            .expect("could not resolve target work dir");
+    /// The directory holding this target's corpus, if it can be located.
+    ///
+    /// `None` rather than a panic: the work dir is resolved from `file!()`,
+    /// which a build may have remapped to a path that does not exist where the
+    /// test runs -- an archived test binary, or one built with
+    /// `--remap-path-prefix`. That is not an error. The only caller reads a
+    /// corpus directory that is already optional, so an unresolvable work dir
+    /// means "no corpus files", exactly as an absent directory does.
+    fn sub_dir<'a, D: Iterator<Item = &'a str>>(&self, dirs: D) -> Option<PathBuf> {
+        let mut fuzz_target_path = self.location.work_dir()?;
 
         fuzz_target_path.extend(dirs);
 
-        fuzz_target_path
+        Some(fuzz_target_path)
     }
 
     fn file_tests<'a, D: Iterator<Item = &'a str> + std::panic::UnwindSafe>(
         &self,
         sub_dirs: D,
     ) -> impl Iterator<Item = NamedTest> {
-        std::fs::read_dir(self.sub_dir(sub_dirs))
-            .ok()
+        self.sub_dir(sub_dirs)
+            .and_then(|dir| std::fs::read_dir(dir).ok())
             .into_iter()
             .flat_map(move |dir| {
                 dir.filter_map(Result::ok)
