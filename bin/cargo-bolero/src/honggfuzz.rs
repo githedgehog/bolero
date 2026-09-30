@@ -55,6 +55,9 @@ pub(crate) fn test(selection: &Selection, test_args: &test::Args) -> Result<()> 
         format!("{}", test_args.timeout_as_secs()),
         // make it consistent with libfuzzer
         "--exit_upon_crash".to_string(),
+        // honggfuzz exits with 0 upon a crash unless told otherwise
+        "--exit_code_upon_crash".to_string(),
+        "1".to_string(),
     ];
 
     optional_arg!(args, "--run_timeout", test_args.time_as_secs());
