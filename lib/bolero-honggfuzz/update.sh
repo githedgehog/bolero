@@ -36,6 +36,14 @@ do
     replace "s/int main/int ${name}_main/" $f
 done
 
+# NOTE: the vendored 2.5 sources carry backports of upstream fixes that no tagged release
+# includes yet. Re-apply them when re-vendoring a version that predates these commits:
+#   - mangle.c: 4cfa62f4fd ("mangle: support gcc-15 with __attribute__((nonstring))"),
+#     or GCC 15+ fails the -Werror build.
+#   - linux/bfd.c: the disassembler()/init_disassemble_info() prototype detection from
+#     de82cde506 and its predecessors, and the `== TRUE` removal from cdefacd313, or the
+#     build fails against binutils >= 2.39.
+
 replace "s/return EXIT_SUCCESS/return hfuzz->cnts.crashesCnt > 0 ? EXIT_FAILURE : EXIT_SUCCESS/" $project_dir/honggfuzz/honggfuzz.c
 
 echo -e "libhonggfuzz.a: \$(OBJS) \$(LCOMMON_ARCH) \$(CRASH_REPORT)\n\t\$(AR) rcs libhonggfuzz.a \$(OBJS) \$(CRASH_REPORT)" >> "$project_dir/honggfuzz/Makefile"

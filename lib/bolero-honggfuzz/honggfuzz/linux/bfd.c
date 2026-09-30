@@ -55,14 +55,6 @@ typedef struct {
     asymbol** dsyms;
 } bfd_t;
 
-/*
- * This is probably the only define which was added with binutils 2.29, so we us
- * it, do decide which disassembler() prototype from dis-asm.h to use
- */
-#if defined(FOR_EACH_DISASSEMBLER_OPTION)
-#define _HF_BFD_GE_2_29
-#endif
-
 static pthread_mutex_t arch_bfd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static bool arch_bfdInit(pid_t pid, bfd_t* bfdParams) {
@@ -172,13 +164,13 @@ void arch_bfdResolveSyms(pid_t pid, funcs_t* funcs, size_t num) {
         long sec_offset = (long)funcs[i].pc - bfd_get_section_vma(bfdParams.bfdh, section);
 
         if (bfd_find_nearest_line(
-                bfdParams.bfdh, section, bfdParams.syms, sec_offset, &file, &func, &line) == TRUE) {
+                bfdParams.bfdh, section, bfdParams.syms, sec_offset, &file, &func, &line)) {
             snprintf(funcs[i].func, sizeof(funcs->func), "%s", func ? func : "");
             snprintf(funcs[i].file, sizeof(funcs->file), "%s", file ? file : "");
             funcs[i].line = line;
         }
         if (bfd_find_nearest_line(
-                bfdParams.bfdh, section, bfdParams.syms, sec_offset, &file, &func, &line) == TRUE) {
+                bfdParams.bfdh, section, bfdParams.syms, sec_offset, &file, &func, &line)) {
             snprintf(funcs[i].func, sizeof(funcs->func), "%s", func ? func : "");
             snprintf(funcs[i].file, sizeof(funcs->file), "%s", file ? file : "");
             funcs[i].line = line;
@@ -195,6 +187,43 @@ static int arch_bfdFPrintF(void* buf, const char* fmt, ...) {
     va_end(args);
 
     return ret;
+}
+
+/*
+ * The 'disassembler_style' is defined with newert dis-asm.h versions only. Use a fake identifier,
+ * just to be able to define a function pointer.
+ */
+enum fake_disassembler_style {
+    hf_fake_dis_asm_style_unused,
+};
+static int arch_bfdFPrintFStyled(
+    void* buf, enum fake_disassembler_style style HF_ATTR_UNUSED, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    int ret = util_vssnprintf(buf, _HF_INSTR_SZ, fmt, args);
+    va_end(args);
+
+    return ret;
+}
+
+typedef disassembler_ftype (*hf_disasm_one_arg_t)(bfd*);
+typedef disassembler_ftype (*hf_disasm_four_args_t)(
+    enum bfd_architecture, int, unsigned long, bfd*);
+typedef disassembler_ftype (*hf_disasm_four_args_bool_t)(
+    enum bfd_architecture, bool, unsigned long, bfd*);
+
+static disassembler_ftype hf_call_disasm_one(void* fn, bfd* bfdh) {
+    return ((hf_disasm_one_arg_t)fn)(bfdh);
+}
+
+static disassembler_ftype hf_call_disasm_four(void* fn, bfd* bfdh) {
+    return ((hf_disasm_four_args_t)fn)(
+        bfd_get_arch(bfdh), bfd_little_endian(bfdh) ? 0 : 1, 0, NULL);
+}
+
+static disassembler_ftype hf_call_disasm_four_bool(void* fn, bfd* bfdh) {
+    return ((hf_disasm_four_args_bool_t)fn)(
+        bfd_get_arch(bfdh), bfd_little_endian(bfdh) ? false : true, 0, NULL);
 }
 
 void arch_bfdDisasm(pid_t pid, uint8_t* mem, size_t size, char* instr) {
@@ -215,12 +244,12 @@ void arch_bfdDisasm(pid_t pid, uint8_t* mem, size_t size, char* instr) {
         bfd_close(bfdh);
         return;
     }
-#if defined(_HF_BFD_GE_2_29)
-    disassembler_ftype disassemble =
-        disassembler(bfd_get_arch(bfdh), bfd_little_endian(bfdh) ? FALSE : TRUE, 0, NULL);
-#else
-    disassembler_ftype disassemble = disassembler(bfdh);
-#endif    // defined(_HD_BFD_GE_2_29)
+
+    disassembler_ftype disassemble = _Generic(&disassembler,
+        hf_disasm_one_arg_t: hf_call_disasm_one,
+        hf_disasm_four_args_bool_t: hf_call_disasm_four_bool,
+        default: hf_call_disasm_four)((void*)&disassembler, bfdh);
+
     if (disassemble == NULL) {
         LOG_W("disassembler() failed");
         bfd_close(bfdh);
@@ -228,7 +257,15 @@ void arch_bfdDisasm(pid_t pid, uint8_t* mem, size_t size, char* instr) {
     }
 
     struct disassemble_info info;
-    init_disassemble_info(&info, instr, arch_bfdFPrintF);
+
+    /*
+     * At some point in time the function init_disassemble_info() started taking 4 arguments instead
+     * of 3. Add the 4th argument in all cases. Hopefully it'll work will all ABIs, and the 4th
+     * argument will be discarded if needed.
+     */
+
+    void (*idi_4_args)(void*, void*, void*, void*) = (void*)init_disassemble_info;
+    idi_4_args(&info, instr, arch_bfdFPrintF, arch_bfdFPrintFStyled);
     info.arch          = bfd_get_arch(bfdh);
     info.mach          = bfd_get_mach(bfdh);
     info.buffer        = mem;
