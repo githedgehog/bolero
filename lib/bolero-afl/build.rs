@@ -4,6 +4,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BOLERO_FUZZER");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_FUZZING_AFL");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BIN");
+    println!("cargo:rerun-if-changed=afl");
+    println!("cargo:rerun-if-changed=src/bolero-afl-util.h");
 
     if std::env::var("CARGO_CFG_FUZZING_AFL").is_ok() {
         let mut build = cc::Build::new();
