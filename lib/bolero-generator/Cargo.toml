@@ -35,6 +35,7 @@ check-cfg = [
   'cfg(kani)',
   'cfg(fuzzing)',
   'cfg(fuzzing_afl)',
+  'cfg(fuzzing_libafl)',
   'cfg(fuzzing_libfuzzer)',
   'cfg(fuzzing_honggfuzz)',
   'cfg(fuzzing_random)',

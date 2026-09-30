@@ -1,0 +1,39 @@
+[package]
+name = "bolero-libafl"
+version = "0.13.0"
+description = "LibAFL plugin for bolero"
+homepage = "https://github.com/camshaft/bolero"
+repository = "https://github.com/camshaft/bolero"
+keywords = ["testing", "fuzz", "fuzzing"]
+license = "MIT"
+edition = "2021"
+readme = "../../README.md"
+# LibAFL needs rustc 1.93.1 or newer. That applies only to builds with `--cfg fuzzing_libafl`,
+# which is the only configuration that compiles LibAFL, so it is not a `rust-version` here:
+# that would hold the whole workspace to it.
+
+[features]
+default = ["lib"]
+lib = ["bolero-engine"]
+
+[dependencies]
+bolero-engine = { version = "0.13.5", path = "../bolero-engine", optional = true, features = ["any"] }
+
+[target.'cfg(fuzzing_libafl)'.dependencies]
+libafl = { version = "0.16.1" }
+libafl_bolts = { version = "0.16.1" }
+# `whole_archive`: under ASan, the sanitizer runtime's weak no-op `__sanitizer_cov_trace_cmp*`
+# otherwise win the link over these, silently disabling the comparison log
+libafl_targets = { version = "0.16.1", features = ["sancov_pcguard_hitcounts", "sancov_cmplog", "whole_archive"] }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [
+  'cfg(kani)',
+  'cfg(fuzzing)',
+  'cfg(fuzzing_afl)',
+  'cfg(fuzzing_libafl)',
+  'cfg(fuzzing_libfuzzer)',
+  'cfg(fuzzing_honggfuzz)',
+  'cfg(fuzzing_random)'
+]

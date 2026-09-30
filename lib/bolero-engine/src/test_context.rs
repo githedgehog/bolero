@@ -12,6 +12,8 @@ pub enum EngineKind {
     Afl,
     /// The Honggfuzz engine
     Honggfuzz,
+    /// The LibAFL engine
+    LibAfl,
     /// The Kani model-checking engine
     Kani,
 }

@@ -14,6 +14,9 @@ cfg_if::cfg_if! {
     } else if #[cfg(fuzzing_honggfuzz)] {
         /// The default engine used when defining a test target
         pub use bolero_honggfuzz::HonggfuzzEngine as DefaultEngine;
+    } else if #[cfg(fuzzing_libafl)] {
+        /// The default engine used when defining a test target
+        pub use bolero_libafl::LibAflEngine as DefaultEngine;
     } else if #[cfg(kani)] {
         pub use bolero_kani::KaniEngine as DefaultEngine;
     } else {
