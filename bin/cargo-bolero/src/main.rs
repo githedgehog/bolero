@@ -14,6 +14,7 @@ mod engine;
 mod honggfuzz;
 #[cfg(feature = "kani")]
 mod kani;
+mod libafl;
 mod libfuzzer;
 mod list;
 mod manifest;
@@ -21,6 +22,7 @@ mod new;
 mod project;
 mod random;
 mod reduce;
+mod rustc_wrapper;
 mod selection;
 mod test;
 mod test_target;
@@ -50,6 +52,10 @@ impl Commands {
 const DEFAULT_TARGET: &str = env!("DEFAULT_TARGET");
 
 fn main() {
+    if rustc_wrapper::is_wrapper_invocation() {
+        rustc_wrapper::run();
+    }
+
     let args = std::env::args()
         .enumerate()
         .filter_map(|(i, v)| match (i, v.as_ref()) {

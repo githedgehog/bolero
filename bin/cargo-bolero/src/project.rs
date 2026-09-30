@@ -128,6 +128,11 @@ impl Project {
             } else {
                 let mut hasher = DefaultHasher::new();
                 rustflags.hash(&mut hasher);
+                // cargo fingerprints the wrapper's path, not what it does to the flags, so a
+                // wrapper change must move the build to a fresh directory
+                if fuzzer == "libafl" {
+                    crate::rustc_wrapper::VERSION.hash(&mut hasher);
+                }
                 cmd.arg("--target-dir")
                     .arg(format!("target/fuzz/build_{:x}", hasher.finish()));
             }
@@ -139,6 +144,16 @@ impl Project {
             cmd.env("RUSTFLAGS", rustflags)
                 .env("RUSTDOCFLAGS", self.rustflags("RUSTDOCFLAGS", flags)?)
                 .env("BOLERO_FUZZER", fuzzer);
+
+            // LibAFL links its fuzzer into the target, so keep its crates uninstrumented
+            if fuzzer == "libafl" {
+                use crate::rustc_wrapper::{INNER_WRAPPER_ENV, WRAPPER_ENV};
+                if let Some(inner) = std::env::var_os("RUSTC_WRAPPER") {
+                    cmd.env(INNER_WRAPPER_ENV, inner);
+                }
+                cmd.env("RUSTC_WRAPPER", std::env::current_exe()?)
+                    .env(WRAPPER_ENV, "1");
+            }
         }
 
         Ok(cmd)
