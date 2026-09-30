@@ -1,6 +1,6 @@
 [package]
 name = "bolero-libafl"
-version = "0.13.0"
+version = "0.14.0"
 description = "LibAFL plugin for bolero"
 homepage = "https://github.com/camshaft/bolero"
 repository = "https://github.com/camshaft/bolero"
@@ -17,7 +17,7 @@ default = ["lib"]
 lib = ["bolero-engine"]
 
 [dependencies]
-bolero-engine = { version = "0.13.5", path = "../bolero-engine", optional = true, features = ["any"] }
+bolero-engine = { version = "0.14.0", path = "../bolero-engine", optional = true, features = ["any"] }
 
 [target.'cfg(fuzzing_libafl)'.dependencies]
 libafl = { version = "0.16.1" }
