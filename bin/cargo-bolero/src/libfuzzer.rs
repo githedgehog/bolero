@@ -113,9 +113,9 @@ pub(crate) fn reduce(selection: &Selection, reduce: &reduce::Args) -> Result<()>
     let mut covered_features = BitSet::<u64>::default();
 
     for result in results {
-        let prev_len = covered_features.len();
+        let prev_len = covered_features.count();
         covered_features.union_with(&result.features);
-        if prev_len != covered_features.len() {
+        if prev_len != covered_features.count() {
             let new_file = tmp_corpus.path().join(result.path.file_name().unwrap());
             fs::rename(result.path, new_file)?;
         }
@@ -209,7 +209,7 @@ fn parse_control_file<'a, I: Iterator<Item = IOResult<String>>>(
     results.sort_by(|a, b| {
         let size_cmp = a.size.cmp(&b.size);
         if size_cmp == Ordering::Equal {
-            a.features.len().cmp(&b.features.len())
+            a.features.count().cmp(&b.features.count())
         } else {
             size_cmp
         }

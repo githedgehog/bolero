@@ -82,22 +82,25 @@ pub struct BufferedRng<'a> {
     buffer: &'a mut Vec<u8>,
 }
 
-impl rand::RngCore for BufferedRng<'_> {
-    fn next_u32(&mut self) -> u32 {
+impl rand::TryRng for BufferedRng<'_> {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut data = [0; 4];
-        self.fill_bytes(&mut data);
-        u32::from_le_bytes(data)
+        self.try_fill_bytes(&mut data)?;
+        Ok(u32::from_le_bytes(data))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut data = [0; 8];
-        self.fill_bytes(&mut data);
-        u64::from_le_bytes(data)
+        self.try_fill_bytes(&mut data)?;
+        Ok(u64::from_le_bytes(data))
     }
 
-    fn fill_bytes(&mut self, bytes: &mut [u8]) {
-        self.rng.fill_bytes(bytes);
+    fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        rand::Rng::fill_bytes(&mut self.rng, bytes);
         self.buffer.extend_from_slice(bytes);
+        Ok(())
     }
 }
 
@@ -124,26 +127,29 @@ pub struct ReplayRng<'a> {
     buffer: &'a [u8],
 }
 
-impl rand::RngCore for ReplayRng<'_> {
-    fn next_u32(&mut self) -> u32 {
+impl rand::TryRng for ReplayRng<'_> {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut data = [0; 4];
-        self.fill_bytes(&mut data);
-        u32::from_le_bytes(data)
+        self.try_fill_bytes(&mut data)?;
+        Ok(u32::from_le_bytes(data))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut data = [0; 8];
-        self.fill_bytes(&mut data);
-        u64::from_le_bytes(data)
+        self.try_fill_bytes(&mut data)?;
+        Ok(u64::from_le_bytes(data))
     }
 
-    fn fill_bytes(&mut self, bytes: &mut [u8]) {
+    fn try_fill_bytes(&mut self, bytes: &mut [u8]) -> Result<(), Self::Error> {
         let len = self.buffer.len().min(bytes.len());
         let (copy_from, remaining) = self.buffer.split_at(len);
         let (copy_to, fill_to) = bytes.split_at_mut(len);
         copy_to.copy_from_slice(copy_from);
         fill_to.fill(0);
         self.buffer = remaining;
+        Ok(())
     }
 }
 

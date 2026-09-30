@@ -9,7 +9,7 @@ keywords = ["testing", "quickcheck", "property", "fuzz", "fuzzing"]
 license = "MIT"
 edition = "2021"
 readme = "README.md"
-rust-version = "1.76.0"
+rust-version = "1.85.0"
 
 [features]
 default = ["afl", "libfuzzer", "kani"]
@@ -20,10 +20,10 @@ libfuzzer = []
 
 [dependencies]
 anyhow = "1.0"
-bit-set = "0.8"
+bit-set = "0.11"
 bolero-afl = { version = "0.13", path = "../../lib/bolero-afl", default-features = false, features = ["bin"], optional = true }
 bolero-honggfuzz = { version = "0.13", path = "../../lib/bolero-honggfuzz", default-features = false, features = ["bin"], optional = true }
-cargo_metadata = "0.19"
+cargo_metadata = "0.20"
 humantime = "2"
 lazy_static = "1"
 rustc_version = "0.4"

@@ -19,7 +19,7 @@ lib = ["bolero-engine"]
 bolero-engine = { version = "0.13.5", path = "../bolero-engine", features = ["cache"], optional = true }
 
 [build-dependencies]
-cc = "1.0"
+cc = "1.5"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
