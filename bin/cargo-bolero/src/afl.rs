@@ -38,6 +38,14 @@ pub(crate) fn test(selection: &Selection, test_args: &test::Args) -> Result<()> 
         std::env::set_var("BOLERO_AFL_MAX_CYCLES", format!("{cycles}"));
     }
 
+    // make it consistent with libfuzzer and honggfuzz: stop at the first crash, and
+    // exit non-zero if one was found
+    std::env::set_var("AFL_BENCH_UNTIL_CRASH", "1");
+
+    if let Some(secs) = test_args.time_as_secs() {
+        std::env::set_var("BOLERO_AFL_RUN_TIME", format!("{secs}"));
+    }
+
     let mut args = vec![
         bin(),
         "-i".to_string(),
@@ -45,6 +53,17 @@ pub(crate) fn test(selection: &Selection, test_args: &test::Args) -> Result<()> 
         "-o".to_string(),
         afl_state.to_str().unwrap().to_string(),
     ];
+
+    // AFL's default 50MB memory limit kills sanitizer builds (ASan alone reserves terabytes
+    // of address space) before the fork server comes up, and address is the default sanitizer
+    if !test_args
+        .engine_args
+        .iter()
+        .any(|arg| arg.starts_with("-m"))
+    {
+        args.push("-m".to_string());
+        args.push("none".to_string());
+    }
 
     args.extend(test_args.engine_args.iter().cloned());
 

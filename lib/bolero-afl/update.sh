@@ -42,3 +42,8 @@ replace \
 replace \
     's/exit(0)/exit(unique_crashes > 0 ? 1 : 0)/' \
     "$project_dir/afl/afl-fuzz.c"
+
+# stop after BOLERO_AFL_RUN_TIME seconds; AFL 2.57b has no time limit of its own
+replace \
+    's/^  if (total_crashes \&\& getenv("AFL_BENCH_UNTIL_CRASH")) stop_soon = 2;$/&\'$'\n''\'$'\n''  if (bolero_afl_run_time_ms() \&\& cur_ms - start_time > bolero_afl_run_time_ms())\'$'\n''    stop_soon = 2;/' \
+    "$project_dir/afl/afl-fuzz.c"

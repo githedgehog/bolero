@@ -4020,6 +4020,9 @@ static void show_stats(void) {
 
   if (total_crashes && getenv("AFL_BENCH_UNTIL_CRASH")) stop_soon = 2;
 
+  if (bolero_afl_run_time_ms() && cur_ms - start_time > bolero_afl_run_time_ms())
+    stop_soon = 2;
+
   /* If we're not on TTY, bail out. */
 
   if (not_on_tty) return;
