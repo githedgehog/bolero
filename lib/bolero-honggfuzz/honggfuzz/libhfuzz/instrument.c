@@ -46,13 +46,21 @@ __attribute__((used)) const char* const LIBHFUZZ_module_instrument = "LIBHFUZZ_m
  */
 static feedback_t bbMapFb;
 
-feedback_t*    globalCovFeedback = &bbMapFb;
-feedback_t*    localCovFeedback  = &bbMapFb;
-cmpfeedback_t* globalCmpFeedback = NULL;
+feedback_t*  globalCovFeedback = &bbMapFb;
+feedback_t*  localCovFeedback  = &bbMapFb;
+fuzz_data_t* globalCmpFeedback = NULL;
 
 uint32_t my_thread_no = 0;
 
-static int _memcmp(const void* m1, const void* m2, size_t n) {
+__attribute__((tls_model("initial-exec"))) __thread uintptr_t hfuzz_prev_pc     = 0;
+__attribute__((tls_model("initial-exec"))) __thread uintptr_t hfuzz_prev_cmp_pc = 0;
+__attribute__((tls_model("initial-exec"))) __thread uint64_t  hfuzz_path_hash   = 0;
+
+static uint32_t localGuardTouched[65536]  = {};
+static uint32_t localGuardTouchedCnt      = 0;
+static bool     localGuardTouchedOverflow = false;
+
+__attribute__((hot)) static int _memcmp(const void* m1, const void* m2, size_t n) {
     const unsigned char* s1 = (const unsigned char*)m1;
     const unsigned char* s2 = (const unsigned char*)m2;
 
@@ -65,9 +73,17 @@ static int _memcmp(const void* m1, const void* m2, size_t n) {
     return 0;
 }
 
-int (*libc_memcmp)(const void* s1, const void* s2, size_t n) = _memcmp;
+int (*hf_memcmp)(const void* s1, const void* s2, size_t n) = _memcmp;
 
-static void* getsym(const char* sym) {
+static void* getsym(const char* fname, const char* sym) {
+    if (fname) {
+        void* dlh = dlopen(fname, RTLD_LAZY);
+        if (!dlh) {
+            return NULL;
+        }
+        return dlsym(dlh, sym);
+    }
+
 #if defined(RTLD_NEXT)
     return dlsym(RTLD_NEXT, sym);
 #else  /* defined(RTLD_NEXT) */
@@ -79,16 +95,48 @@ static void* getsym(const char* sym) {
 #endif /* defined(RTLD_NEXT) */
 }
 
+extern int __wrap_memcmp(const void* s1, const void* s2, size_t n) __attribute__((weak));
+extern int __sanitizer_weak_hook_memcmp(const void* s1, const void* s2, size_t n)
+    __attribute__((weak));
 static void initializeLibcFunctions(void) {
-    libc_memcmp = (int (*)(const void* s1, const void* s2, size_t n))getsym("memcmp");
-    if (!libc_memcmp) {
-        LOG_W("dlsym(memcmp) failed: %s", dlerror());
-        libc_memcmp = _memcmp;
+    /*
+     * Look for the original "memcmp" function.
+     *
+     * First, in standard C libraries, because if an instrumented shared library is loaded, it can
+     * overshadow the libc's symbol. Next, among the already loaded symbols.
+     */
+    int (*libcso6_memcmp)(const void* s1, const void* s2, size_t n) =
+        (int (*)(const void* s1, const void* s2, size_t n))getsym("libc.so.6", "memcmp");
+    int (*libcso_memcmp)(const void* s1, const void* s2, size_t n) =
+        (int (*)(const void* s1, const void* s2, size_t n))getsym("libc.so", "memcmp");
+    int (*libc_memcmp)(const void* s1, const void* s2, size_t n) =
+        (int (*)(const void* s1, const void* s2, size_t n))getsym(NULL, "memcmp");
+
+    if (libcso6_memcmp) {
+        hf_memcmp = libcso6_memcmp;
+    } else if (libcso_memcmp) {
+        hf_memcmp = libcso_memcmp;
+    } else if (libc_memcmp) {
+        hf_memcmp = libc_memcmp;
     }
-    LOG_D("libc_memcmp=%p, (_memcmp=%p, memcmp=%p)", libc_memcmp, _memcmp, memcmp);
+
+    if (hf_memcmp == __wrap_memcmp) {
+        LOG_W("hf_memcmp==__wrap_memcmp: %p==%p", hf_memcmp, __wrap_memcmp);
+        hf_memcmp = _memcmp;
+    }
+    if (hf_memcmp == __sanitizer_weak_hook_memcmp) {
+        LOG_W("hf_memcmp==__sanitizer_weak_hook_memcmp: %p==%p", hf_memcmp,
+            __sanitizer_weak_hook_memcmp);
+        hf_memcmp = _memcmp;
+    }
+
+    LOG_D("hf_memcmp=%p, (_memcmp=%p, memcmp=%p, __wrap_memcmp=%p, "
+          "__sanitizer_weak_hook_memcmp=%p, libcso6_memcmp=%p, libcso_memcmp=%p, libc_memcmp=%p)",
+        hf_memcmp, _memcmp, memcmp, __wrap_memcmp, __sanitizer_weak_hook_memcmp, libcso6_memcmp,
+        libcso_memcmp, libc_memcmp);
 }
 
-static void* initialzeTryMapHugeTLB(int fd, size_t sz) {
+static void* initializeTryMapHugeTLB(int fd, size_t sz) {
     int initflags = MAP_SHARED;
 #if defined(MAP_ALIGNED_SUPER)
     initflags |= MAP_ALIGNED_SUPER;
@@ -110,17 +158,17 @@ static void initializeCmpFeedback(void) {
     if (fstat(_HF_CMP_BITMAP_FD, &st) == -1) {
         return;
     }
-    if (st.st_size != sizeof(cmpfeedback_t)) {
+    if (st.st_size != sizeof(fuzz_data_t)) {
         LOG_W(
-            "Size of the globalCmpFeedback structure mismatch: st.size != sizeof(cmpfeedback_t) "
+            "Size of the globalCmpFeedback structure mismatch: st.size != sizeof(fuzz_data_t) "
             "(%zu != %zu). Link your fuzzed binaries with the newest honggfuzz and hfuzz-clang(++)",
-            (size_t)st.st_size, sizeof(cmpfeedback_t));
+            (size_t)st.st_size, sizeof(fuzz_data_t));
         return;
     }
-    void* ret = initialzeTryMapHugeTLB(_HF_CMP_BITMAP_FD, sizeof(cmpfeedback_t));
+    void* ret = initializeTryMapHugeTLB(_HF_CMP_BITMAP_FD, sizeof(fuzz_data_t));
     if (ret == MAP_FAILED) {
         PLOG_W("mmap(_HF_CMP_BITMAP_FD=%d, size=%zu) of the feedback structure failed",
-            _HF_CMP_BITMAP_FD, sizeof(cmpfeedback_t));
+            _HF_CMP_BITMAP_FD, sizeof(fuzz_data_t));
         return;
     }
     ATOMIC_SET(globalCmpFeedback, ret);
@@ -138,7 +186,7 @@ static bool initializeLocalCovFeedback(void) {
         return false;
     }
 
-    localCovFeedback = initialzeTryMapHugeTLB(_HF_PERTHREAD_BITMAP_FD, sizeof(feedback_t));
+    localCovFeedback = initializeTryMapHugeTLB(_HF_PERTHREAD_BITMAP_FD, sizeof(feedback_t));
     if (localCovFeedback == MAP_FAILED) {
         PLOG_W("mmap(_HF_PERTHREAD_BITMAP_FD=%d, size=%zu) of the local feedback structure failed",
             _HF_PERTHREAD_BITMAP_FD, sizeof(feedback_t));
@@ -159,7 +207,7 @@ static bool initializeGlobalCovFeedback(void) {
         return false;
     }
 
-    globalCovFeedback = initialzeTryMapHugeTLB(_HF_COV_BITMAP_FD, sizeof(feedback_t));
+    globalCovFeedback = initializeTryMapHugeTLB(_HF_COV_BITMAP_FD, sizeof(feedback_t));
     if (globalCovFeedback == MAP_FAILED) {
         PLOG_W("mmap(_HF_COV_BITMAP_FD=%d, size=%zu) of the feedback structure failed",
             _HF_COV_BITMAP_FD, sizeof(feedback_t));
@@ -230,45 +278,79 @@ __attribute__((weak)) size_t instrumentReserveGuard(size_t cnt) {
 }
 
 void instrumentResetLocalCovFeedback(void) {
-    bzero(localCovFeedback->pcGuardMap, HF_MIN(instrumentReserveGuard(0), _HF_PC_GUARD_MAX));
+    if (!ATOMIC_XCHG(localGuardTouchedOverflow, false)) {
+        uint32_t cnt = ATOMIC_XCHG(localGuardTouchedCnt, 0);
+        if (cnt > ARRAYSIZE(localGuardTouched)) {
+            cnt = ARRAYSIZE(localGuardTouched);
+        }
+        for (uint32_t i = 0; i < cnt; i++) {
+            ATOMIC_CLEAR(localCovFeedback->pcGuardMap[localGuardTouched[i]]);
+        }
+        return;
+    }
 
-    wmb();
+    ATOMIC_CLEAR(localGuardTouchedCnt);
+    bzero(localCovFeedback->pcGuardMap, HF_MIN(instrumentReserveGuard(0), _HF_PC_GUARD_MAX));
 }
 
 /* Used to limit certain expensive actions, like adding values to dictionaries */
 static inline bool instrumentLimitEvery(uint64_t step) {
-    if (util_rndGet(0, step) == 0) return true;
-    return false;
+    static uint64_t counter = 0;
+    uint64_t        val     = __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
+    if (((step + 1) & step) == 0) {
+        return ((val & step) == 0);
+    }
+    return ((val % (step + 1)) == 0);
 }
 
 static inline void instrumentAddConstMemInternal(const void* mem, size_t len) {
     if (len <= 1) {
         return;
     }
-    if (len > sizeof(globalCmpFeedback->valArr[0].val)) {
-        len = sizeof(globalCmpFeedback->valArr[0].val);
-    }
-    uint32_t curroff = ATOMIC_GET(globalCmpFeedback->cnt);
-    if (curroff >= ARRAYSIZE(globalCmpFeedback->valArr)) {
-        return;
+    if (len > sizeof(globalCmpFeedback->dict[0].val)) {
+        len = sizeof(globalCmpFeedback->dict[0].val);
     }
 
-    for (uint32_t i = 0; i < curroff; i++) {
-        if ((len == ATOMIC_GET(globalCmpFeedback->valArr[i].len)) &&
-            libc_memcmp(globalCmpFeedback->valArr[i].val, mem, len) == 0) {
+    const uint32_t arrSize   = ARRAYSIZE(globalCmpFeedback->dict);
+    const uint32_t staticCnt = globalCmpFeedback->dictStaticCnt;
+    uint32_t       curroff   = ATOMIC_GET(globalCmpFeedback->dictCnt);
+
+    uint32_t checkCnt  = 16384;
+    uint32_t scanLimit = (curroff < checkCnt) ? curroff : checkCnt;
+    uint32_t scanStart = curroff - scanLimit;
+
+    for (uint32_t i = scanStart; i < curroff; i++) {
+        uint32_t idx;
+        if (i < arrSize) {
+            idx = i;
+        } else {
+            uint32_t dynSz = arrSize - staticCnt;
+            if (dynSz == 0)
+                idx = 0;
+            else
+                idx = staticCnt + ((i - arrSize) % dynSz);
+        }
+
+        if ((len == ATOMIC_GET(globalCmpFeedback->dict[idx].len)) &&
+            hf_memcmp(globalCmpFeedback->dict[idx].val, mem, len) == 0) {
             return;
         }
     }
 
-    uint32_t newoff = ATOMIC_POST_INC(globalCmpFeedback->cnt);
-    if (newoff >= ARRAYSIZE(globalCmpFeedback->valArr)) {
-        ATOMIC_SET(globalCmpFeedback->cnt, ARRAYSIZE(globalCmpFeedback->valArr));
-        return;
+    uint32_t newoff = ATOMIC_POST_INC(globalCmpFeedback->dictCnt);
+    uint32_t idx;
+    if (newoff < arrSize) {
+        idx = newoff;
+    } else {
+        uint32_t dynSz = arrSize - staticCnt;
+        if (dynSz == 0)
+            idx = 0;
+        else
+            idx = staticCnt + ((newoff - arrSize) % dynSz);
     }
 
-    memcpy(globalCmpFeedback->valArr[newoff].val, mem, len);
-    ATOMIC_SET(globalCmpFeedback->valArr[newoff].len, len);
-    wmb();
+    memcpy(globalCmpFeedback->dict[idx].val, mem, len);
+    ATOMIC_SET(globalCmpFeedback->dict[idx].len, len);
 }
 
 /*
@@ -279,7 +361,7 @@ HF_REQUIRE_SSE42_POPCNT void __cyg_profile_func_enter(void* func, void* caller) 
         (((uintptr_t)func << 12) | ((uintptr_t)caller & 0xFFF)) & _HF_PERF_BITMAP_BITSZ_MASK;
     register bool prev = ATOMIC_BITMAP_SET(globalCovFeedback->bbMapPc, pos);
     if (!prev) {
-        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no]);
+        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no].val);
     }
 }
 
@@ -292,11 +374,15 @@ HF_REQUIRE_SSE42_POPCNT void __cyg_profile_func_exit(
  * -fsanitize-coverage=trace-pc
  */
 HF_REQUIRE_SSE42_POPCNT static inline void hfuzz_trace_pc_internal(uintptr_t pc) {
-    register uintptr_t ret = pc & _HF_PERF_BITMAP_BITSZ_MASK;
+    register uintptr_t ret = (pc ^ (hfuzz_prev_pc >> 1)) & _HF_PERF_BITMAP_BITSZ_MASK;
+    hfuzz_prev_pc          = pc;
+
+    /* Accumulate path hash for diversity tracking (simple rolling hash) */
+    hfuzz_path_hash = (hfuzz_path_hash * 31) ^ ret;
 
     register bool prev = ATOMIC_BITMAP_SET(globalCovFeedback->bbMapPc, ret);
     if (!prev) {
-        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no]);
+        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no].val);
     }
 }
 
@@ -313,45 +399,57 @@ HF_REQUIRE_SSE42_POPCNT void hfuzz_trace_pc(uintptr_t pc) {
  */
 HF_REQUIRE_SSE42_POPCNT static inline void hfuzz_trace_cmp1_internal(
     uintptr_t pc, uint8_t Arg1, uint8_t Arg2) {
-    uintptr_t        pos  = pc % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos         = (pc ^ (hfuzz_prev_cmp_pc >> 1)) & (_HF_PERF_BITMAP_SIZE_16M - 1);
+    hfuzz_prev_cmp_pc     = pc;
     register uint8_t v    = ((sizeof(Arg1) * 8) - __builtin_popcount(Arg1 ^ Arg2));
     uint8_t          prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
+        /* Track CMP progress for power scheduling */
+        ATOMIC_POST_ADD(globalCovFeedback->pidCmpProgress[my_thread_no].val, v - prev);
     }
 }
 
 HF_REQUIRE_SSE42_POPCNT static inline void hfuzz_trace_cmp2_internal(
     uintptr_t pc, uint16_t Arg1, uint16_t Arg2) {
-    uintptr_t        pos  = pc % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos         = (pc ^ (hfuzz_prev_cmp_pc >> 1)) & (_HF_PERF_BITMAP_SIZE_16M - 1);
+    hfuzz_prev_cmp_pc     = pc;
     register uint8_t v    = ((sizeof(Arg1) * 8) - __builtin_popcount(Arg1 ^ Arg2));
     uint8_t          prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
+        /* Track CMP progress for power scheduling */
+        ATOMIC_POST_ADD(globalCovFeedback->pidCmpProgress[my_thread_no].val, v - prev);
     }
 }
 
 HF_REQUIRE_SSE42_POPCNT static inline void hfuzz_trace_cmp4_internal(
     uintptr_t pc, uint32_t Arg1, uint32_t Arg2) {
-    uintptr_t        pos  = pc % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos         = (pc ^ (hfuzz_prev_cmp_pc >> 1)) & (_HF_PERF_BITMAP_SIZE_16M - 1);
+    hfuzz_prev_cmp_pc     = pc;
     register uint8_t v    = ((sizeof(Arg1) * 8) - __builtin_popcount(Arg1 ^ Arg2));
     uint8_t          prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
+        /* Track CMP progress for power scheduling */
+        ATOMIC_POST_ADD(globalCovFeedback->pidCmpProgress[my_thread_no].val, v - prev);
     }
 }
 
 HF_REQUIRE_SSE42_POPCNT static inline void hfuzz_trace_cmp8_internal(
     uintptr_t pc, uint64_t Arg1, uint64_t Arg2) {
-    uintptr_t        pos  = pc % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos         = (pc ^ (hfuzz_prev_cmp_pc >> 1)) & (_HF_PERF_BITMAP_SIZE_16M - 1);
+    hfuzz_prev_cmp_pc     = pc;
     register uint8_t v    = ((sizeof(Arg1) * 8) - __builtin_popcountll(Arg1 ^ Arg2));
     uint8_t          prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
+        /* Track CMP progress for power scheduling */
+        ATOMIC_POST_ADD(globalCovFeedback->pidCmpProgress[my_thread_no].val, v - prev);
     }
 }
 
@@ -364,21 +462,62 @@ void __sanitizer_cov_trace_cmp2(uint16_t Arg1, uint16_t Arg2) {
     hfuzz_trace_cmp2_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
 
+/*
+ * Check if the value should be added to the dynamic dictionary.
+ * Skip small values (likely counters, small sizes) to avoid pollution.
+ */
+__attribute__((always_inline)) static inline bool instrumentValueInteresting(uint64_t val) {
+    if (val <= 0xFFFF) {
+        return false;
+    }
+    return true;
+}
+
+static bool instrument32bitValInBinary(uint32_t v) {
+    if (!globalCmpFeedback || globalCmpFeedback->ro32Cnt == 0) {
+        return false;
+    }
+    size_t lo = 0, hi = globalCmpFeedback->ro32Cnt;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (globalCmpFeedback->ro32[mid] < v) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo < globalCmpFeedback->ro32Cnt && globalCmpFeedback->ro32[lo] == v);
+}
+
+static bool instrument64bitValInBinary(uint64_t v) {
+    if (!globalCmpFeedback || globalCmpFeedback->ro64Cnt == 0) {
+        return false;
+    }
+    size_t lo = 0, hi = globalCmpFeedback->ro64Cnt;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (globalCmpFeedback->ro64[mid] < v) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo < globalCmpFeedback->ro64Cnt && globalCmpFeedback->ro64[lo] == v);
+}
+
 void __sanitizer_cov_trace_cmp4(uint32_t Arg1, uint32_t Arg2) {
     /* Add 4byte values to the const_dictionary if they exist within the binary */
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (Arg1 > 0xffff) {
-            uint32_t bswp = __builtin_bswap32(Arg1);
-            if (util_32bitValInBinary(Arg1) || util_32bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                if (instrument32bitValInBinary(Arg1)) {
+                    instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+                }
             }
-        }
-        if (Arg2 > 0xffff) {
-            uint32_t bswp = __builtin_bswap32(Arg2);
-            if (util_32bitValInBinary(Arg2) || util_32bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+            if (instrumentValueInteresting(Arg2)) {
+                if (instrument32bitValInBinary(Arg2)) {
+                    instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
+                }
             }
         }
     }
@@ -388,19 +527,17 @@ void __sanitizer_cov_trace_cmp4(uint32_t Arg1, uint32_t Arg2) {
 
 void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2) {
     /* Add 8byte values to the const_dictionary if they exist within the binary */
-    if (globalCmpFeedback && instrumentLimitEvery(4095)) {
-        if (Arg1 > 0xffffff) {
-            uint64_t bswp = __builtin_bswap64(Arg1);
-            if (util_64bitValInBinary(Arg1) || util_64bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                if (instrument64bitValInBinary(Arg1)) {
+                    instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+                }
             }
-        }
-        if (Arg2 > 0xffffff) {
-            uint64_t bswp = __builtin_bswap64(Arg2);
-            if (util_64bitValInBinary(Arg2) || util_64bitValInBinary(bswp)) {
-                instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
-                instrumentAddConstMemInternal(&bswp, sizeof(bswp));
+            if (instrumentValueInteresting(Arg2)) {
+                if (instrument64bitValInBinary(Arg2)) {
+                    instrumentAddConstMemInternal(&Arg2, sizeof(Arg2));
+                }
             }
         }
     }
@@ -410,33 +547,36 @@ void __sanitizer_cov_trace_cmp8(uint64_t Arg1, uint64_t Arg2) {
 
 /* Standard __sanitizer_cov_trace_const_cmp wrappers */
 void __sanitizer_cov_trace_const_cmp1(uint8_t Arg1, uint8_t Arg2) {
-    instrumentAddConstMem(&Arg1, sizeof(Arg1), /* check_if_ro= */ false);
     hfuzz_trace_cmp1_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
 
 void __sanitizer_cov_trace_const_cmp2(uint16_t Arg1, uint16_t Arg2) {
-    if (Arg1) {
-        uint16_t bswp = __builtin_bswap16(Arg1);
-        instrumentAddConstMem(&bswp, sizeof(bswp), /* check_if_ro= */ false);
-        instrumentAddConstMem(&Arg1, sizeof(Arg1), /* check_if_ro= */ false);
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+        }
     }
     hfuzz_trace_cmp2_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
 
 void __sanitizer_cov_trace_const_cmp4(uint32_t Arg1, uint32_t Arg2) {
-    if (Arg1) {
-        uint32_t bswp = __builtin_bswap32(Arg1);
-        instrumentAddConstMem(&bswp, sizeof(bswp), /* check_if_ro= */ false);
-        instrumentAddConstMem(&Arg1, sizeof(Arg1), /* check_if_ro= */ false);
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+            }
+        }
     }
     hfuzz_trace_cmp4_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
 
 void __sanitizer_cov_trace_const_cmp8(uint64_t Arg1, uint64_t Arg2) {
-    if (Arg1) {
-        uint64_t bswp = __builtin_bswap64(Arg1);
-        instrumentAddConstMem(&bswp, sizeof(bswp), /* check_if_ro= */ false);
-        instrumentAddConstMem(&Arg1, sizeof(Arg1), /* check_if_ro= */ false);
+    if (globalCmpFeedback) {
+        if (instrumentLimitEvery(16383)) {
+            if (instrumentValueInteresting(Arg1)) {
+                instrumentAddConstMemInternal(&Arg1, sizeof(Arg1));
+            }
+        }
     }
     hfuzz_trace_cmp8_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
 }
@@ -465,18 +605,18 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_cmp(
     uint64_t SizeAndType, uint64_t Arg1, uint64_t Arg2) {
     uint64_t CmpSize = (SizeAndType >> 32) / 8;
     switch (CmpSize) {
-        case (sizeof(uint8_t)):
-            hfuzz_trace_cmp1_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
-            return;
-        case (sizeof(uint16_t)):
-            hfuzz_trace_cmp2_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
-            return;
-        case (sizeof(uint32_t)):
-            hfuzz_trace_cmp4_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
-            return;
-        case (sizeof(uint64_t)):
-            hfuzz_trace_cmp8_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
-            return;
+    case (sizeof(uint8_t)):
+        hfuzz_trace_cmp1_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
+        return;
+    case (sizeof(uint16_t)):
+        hfuzz_trace_cmp2_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
+        return;
+    case (sizeof(uint32_t)):
+        hfuzz_trace_cmp4_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
+        return;
+    case (sizeof(uint64_t)):
+        hfuzz_trace_cmp8_internal((uintptr_t)__builtin_return_address(0), Arg1, Arg2);
+        return;
     }
 }
 
@@ -485,48 +625,100 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_cmp(
  * Cases[1] is length of Val in bits
  */
 HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_switch(uint64_t Val, uint64_t* Cases) {
-    for (uint64_t i = 0; i < Cases[0]; i++) {
-        uintptr_t pos  = ((uintptr_t)__builtin_return_address(0) + i) % _HF_PERF_BITMAP_SIZE_16M;
-        uint8_t   v    = (uint8_t)Cases[1] - __builtin_popcountll(Val ^ Cases[i + 2]);
-        uint8_t   prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
+    uint64_t cnt  = Cases[0];
+    uint64_t bits = Cases[1];
+
+    if (!bits) {
+        return;
+    }
+    if (bits > 64) {
+        bits = 64;
+    }
+
+    size_t len = (size_t)(bits / 8);
+
+    if (globalCmpFeedback && len > 1 && instrumentLimitEvery(16383)) {
+        uint64_t limit = (cnt < 16) ? cnt : 16;
+        for (uint64_t i = 0; i < limit; i++) {
+            uint64_t cval = Cases[i + 2];
+            if (instrumentValueInteresting(cval)) {
+                instrumentAddConstMemInternal(&cval, len);
+            }
+        }
+    }
+
+    uint64_t limit = (cnt < 128) ? cnt : 128;
+    for (uint64_t i = 0; i < limit; i++) {
+        uintptr_t pos =
+            (((uintptr_t)__builtin_return_address(0) + i) & (_HF_PERF_BITMAP_SIZE_16M - 1));
+
+        uint64_t diff = Val ^ Cases[i + 2];
+        if (bits < 64) {
+            diff &= ((1ULL << bits) - 1);
+        }
+
+        uint8_t v    = (uint8_t)bits - __builtin_popcountll(diff);
+        uint8_t prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
         if (prev < v) {
             ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-            ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+            ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
         }
     }
 }
 
 /*
- * gcc-8 -fsanitize-coverage=trace-cmp trace hooks
- * TODO: evaluate, whether it makes sense to implement them
+ * gcc-8 -fsanitize-coverage=trace-cmp trace hooks for floating point
+ * Compare float/double by treating their bit representation as integers
  */
-HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_cmpf(
-    float Arg1 HF_ATTR_UNUSED, float Arg2 HF_ATTR_UNUSED) {
+HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_cmpf(float Arg1, float Arg2) {
+    union {
+        float    f;
+        uint32_t i;
+    } u1 = {.f = Arg1}, u2 = {.f = Arg2};
+    hfuzz_trace_cmp4_internal((uintptr_t)__builtin_return_address(0), u1.i, u2.i);
 }
-HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_cmpd(
-    double Arg1 HF_ATTR_UNUSED, double Arg2 HF_ATTR_UNUSED) {
+
+HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_cmpd(double Arg1, double Arg2) {
+    union {
+        double   d;
+        uint64_t i;
+    } u1 = {.d = Arg1}, u2 = {.d = Arg2};
+    hfuzz_trace_cmp8_internal((uintptr_t)__builtin_return_address(0), u1.i, u2.i);
 }
 
 /*
  * -fsanitize-coverage=trace-div
  */
 HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_div8(uint64_t Val) {
-    uintptr_t pos  = (uintptr_t)__builtin_return_address(0) % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos  = (uintptr_t)__builtin_return_address(0) & (_HF_PERF_BITMAP_SIZE_16M - 1);
     uint8_t   v    = ((sizeof(Val) * 8) - __builtin_popcountll(Val));
     uint8_t   prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
     }
 }
 
 HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_div4(uint32_t Val) {
-    uintptr_t pos  = (uintptr_t)__builtin_return_address(0) % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos  = (uintptr_t)__builtin_return_address(0) & (_HF_PERF_BITMAP_SIZE_16M - 1);
     uint8_t   v    = ((sizeof(Val) * 8) - __builtin_popcount(Val));
     uint8_t   prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
+    }
+}
+
+/*
+ * -fsanitize-coverage=trace-gep
+ */
+HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_gep(uintptr_t Idx) {
+    uintptr_t pos  = (uintptr_t)__builtin_return_address(0) & (_HF_PERF_BITMAP_SIZE_16M - 1);
+    uint8_t   v    = ((sizeof(Idx) * 8) - __builtin_popcountll(Idx));
+    uint8_t   prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
+    if (prev < v) {
+        ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
     }
 }
 
@@ -540,7 +732,7 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_pc_indir(uintptr_t callee) {
 
     register bool prev = ATOMIC_BITMAP_SET(globalCovFeedback->bbMapPc, pos);
     if (!prev) {
-        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no]);
+        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no].val);
     }
 }
 
@@ -556,7 +748,7 @@ __attribute__((weak)) HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_indir_call16(
 
     register bool prev = ATOMIC_BITMAP_SET(globalCovFeedback->bbMapPc, pos);
     if (!prev) {
-        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no]);
+        ATOMIC_PRE_INC(globalCovFeedback->pidNewPC[my_thread_no].val);
     }
 }
 
@@ -586,8 +778,6 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_pc_guard_init(uint32_t* start
         uint32_t guardNo = instrumentReserveGuard(1);
         *x               = guardNo;
     }
-
-    wmb();
 }
 
 /* Map number of visits to an edge into buckets */
@@ -649,9 +839,17 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_pc_guard(uint32_t* guard_ptr)
     /* Update the total/local counters */
     const uint8_t v = ATOMIC_PRE_INC(localCovFeedback->pcGuardMap[guard]);
     if (v == 1) {
-        ATOMIC_PRE_INC(globalCovFeedback->pidTotalEdge[my_thread_no]);
+        if (!ATOMIC_GET(localGuardTouchedOverflow)) {
+            uint32_t idx = ATOMIC_POST_INC(localGuardTouchedCnt);
+            if (idx < ARRAYSIZE(localGuardTouched)) {
+                localGuardTouched[idx] = guard;
+            } else {
+                ATOMIC_SET(localGuardTouchedOverflow, true);
+            }
+        }
+        ATOMIC_PRE_INC(globalCovFeedback->pidTotalEdge[my_thread_no].val);
     } else {
-        ATOMIC_PRE_INC(globalCovFeedback->pidTotalCmp[my_thread_no]);
+        ATOMIC_PRE_INC(globalCovFeedback->pidTotalCmp[my_thread_no].val);
     }
 
     /* Update the new/global counters */
@@ -659,9 +857,19 @@ HF_REQUIRE_SSE42_POPCNT void __sanitizer_cov_trace_pc_guard(uint32_t* guard_ptr)
     if (ATOMIC_GET(globalCovFeedback->pcGuardMap[guard]) < newval) {
         const uint8_t oldval = ATOMIC_POST_OR(globalCovFeedback->pcGuardMap[guard], newval);
         if (!oldval) {
-            ATOMIC_PRE_INC(globalCovFeedback->pidNewEdge[my_thread_no]);
+            ATOMIC_PRE_INC(globalCovFeedback->pidNewEdge[my_thread_no].val);
+            /* Track edge frequency for rare edge detection */
+            uint16_t bucket = guard & 0xFFFF;
+            uint8_t  hitCnt = ATOMIC_GET(globalCovFeedback->edgeHitCnt[bucket]);
+            if (hitCnt < 255) {
+                hitCnt = ATOMIC_PRE_INC(globalCovFeedback->edgeHitCnt[bucket]);
+            }
+            /* Edge is "rare" if seen by fewer than 4 corpus entries */
+            if (hitCnt < 4) {
+                ATOMIC_PRE_INC(globalCovFeedback->pidRareEdgeCnt[my_thread_no].val);
+            }
         } else if (oldval < newval) {
-            ATOMIC_PRE_INC(globalCovFeedback->pidNewCmp[my_thread_no]);
+            ATOMIC_PRE_INC(globalCovFeedback->pidNewCmp[my_thread_no].val);
         }
     }
 }
@@ -674,8 +882,6 @@ static struct {
 } hf8bitcounters[256] = {};
 
 void instrument8BitCountersCount(void) {
-    rmb();
-
     uint64_t totalEdge = 0;
     uint64_t totalCmp  = 0;
 
@@ -694,9 +900,18 @@ void instrument8BitCountersCount(void) {
             if (ATOMIC_GET(globalCovFeedback->pcGuardMap[guard]) < newval) {
                 const uint8_t oldval = ATOMIC_POST_OR(globalCovFeedback->pcGuardMap[guard], newval);
                 if (!oldval) {
-                    ATOMIC_PRE_INC(globalCovFeedback->pidNewEdge[my_thread_no]);
+                    ATOMIC_PRE_INC(globalCovFeedback->pidNewEdge[my_thread_no].val);
+                    /* Track edge frequency for rare edge detection */
+                    uint16_t bucket = guard & 0xFFFF;
+                    uint8_t  hitCnt = ATOMIC_GET(globalCovFeedback->edgeHitCnt[bucket]);
+                    if (hitCnt < 255) {
+                        hitCnt = ATOMIC_PRE_INC(globalCovFeedback->edgeHitCnt[bucket]);
+                    }
+                    if (hitCnt < 4) {
+                        ATOMIC_PRE_INC(globalCovFeedback->pidRareEdgeCnt[my_thread_no].val);
+                    }
                 } else if (oldval < newval) {
-                    ATOMIC_PRE_INC(globalCovFeedback->pidNewCmp[my_thread_no]);
+                    ATOMIC_PRE_INC(globalCovFeedback->pidNewCmp[my_thread_no].val);
                 }
             }
 
@@ -710,8 +925,8 @@ void instrument8BitCountersCount(void) {
         }
     }
 
-    ATOMIC_POST_ADD(globalCovFeedback->pidTotalEdge[my_thread_no], totalEdge);
-    ATOMIC_POST_ADD(globalCovFeedback->pidTotalCmp[my_thread_no], totalCmp);
+    ATOMIC_POST_ADD(globalCovFeedback->pidTotalEdge[my_thread_no].val, totalEdge);
+    ATOMIC_POST_ADD(globalCovFeedback->pidTotalCmp[my_thread_no].val, totalCmp);
 }
 
 void __sanitizer_cov_8bit_counters_init(char* start, char* end) {
@@ -747,14 +962,49 @@ unsigned instrumentThreadNo(void) {
 /* For some reason -fsanitize=fuzzer-no-link references this symbol */
 __attribute__((tls_model("initial-exec")))
 __attribute__((weak)) __thread uintptr_t __sancov_lowest_stack = 0;
+
+/* Base stack pointer at start of each iteration */
+static __thread uintptr_t hfuzz_base_stack = 0;
 #endif /* !defined(__CYGWIN__) */
 
+void instrumentResetStackDepth(void) {
+    /* Reset path hash for this execution - do this on all platforms */
+    hfuzz_path_hash = 0;
+#if !defined(__CYGWIN__)
+    /* Reset to current stack pointer - will track how deep we go from here */
+    hfuzz_base_stack      = (uintptr_t)__builtin_frame_address(0);
+    __sancov_lowest_stack = hfuzz_base_stack;
+#endif /* !defined(__CYGWIN__) */
+}
+
+void instrumentCheckStackDepth(void) {
+#if !defined(__CYGWIN__)
+    uintptr_t lowest = __sancov_lowest_stack;
+    if (lowest == 0 || hfuzz_base_stack == 0) {
+        return;
+    }
+    /* Stack grows downward: depth = base - lowest */
+    size_t depth = (hfuzz_base_stack > lowest) ? (hfuzz_base_stack - lowest) : 0;
+    if (depth == 0) {
+        return;
+    }
+    ATOMIC_SET(globalCovFeedback->pidLastStackDepth[my_thread_no].val, depth);
+    size_t prev = ATOMIC_GET(globalCovFeedback->maxStackDepth[my_thread_no].val);
+    if (depth > prev) {
+        ATOMIC_SET(globalCovFeedback->maxStackDepth[my_thread_no].val, depth);
+        ATOMIC_SET(globalCovFeedback->pidNewStackDepth[my_thread_no].val, true);
+    }
+    /* Store path hash for diversity tracking */
+    ATOMIC_SET(globalCovFeedback->pidPathHash[my_thread_no].val, hfuzz_path_hash);
+#endif /* !defined(__CYGWIN__) */
+}
+
 bool instrumentUpdateCmpMap(uintptr_t addr, uint32_t v) {
-    uintptr_t pos  = addr % _HF_PERF_BITMAP_SIZE_16M;
+    uintptr_t pos  = addr & (_HF_PERF_BITMAP_SIZE_16M - 1);
     uint32_t  prev = ATOMIC_GET(globalCovFeedback->bbMapCmp[pos]);
     if (prev < v) {
         ATOMIC_SET(globalCovFeedback->bbMapCmp[pos], v);
-        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no], v - prev);
+        ATOMIC_POST_ADD(globalCovFeedback->pidNewCmp[my_thread_no].val, v - prev);
         return true;
     }
     return false;
@@ -762,13 +1012,13 @@ bool instrumentUpdateCmpMap(uintptr_t addr, uint32_t v) {
 
 /* Reset the counters of newly discovered edges/pcs/features */
 void instrumentClearNewCov() {
-    ATOMIC_CLEAR(globalCovFeedback->pidNewPC[my_thread_no]);
-    ATOMIC_CLEAR(globalCovFeedback->pidNewEdge[my_thread_no]);
-    ATOMIC_CLEAR(globalCovFeedback->pidNewCmp[my_thread_no]);
+    ATOMIC_CLEAR(globalCovFeedback->pidNewPC[my_thread_no].val);
+    ATOMIC_CLEAR(globalCovFeedback->pidNewEdge[my_thread_no].val);
+    ATOMIC_CLEAR(globalCovFeedback->pidNewCmp[my_thread_no].val);
 
-    ATOMIC_CLEAR(globalCovFeedback->pidTotalPC[my_thread_no]);
-    ATOMIC_CLEAR(globalCovFeedback->pidTotalEdge[my_thread_no]);
-    ATOMIC_CLEAR(globalCovFeedback->pidTotalCmp[my_thread_no]);
+    ATOMIC_CLEAR(globalCovFeedback->pidTotalPC[my_thread_no].val);
+    ATOMIC_CLEAR(globalCovFeedback->pidTotalEdge[my_thread_no].val);
+    ATOMIC_CLEAR(globalCovFeedback->pidTotalCmp[my_thread_no].val);
 }
 
 void instrumentAddConstMem(const void* mem, size_t len, bool check_if_ro) {
@@ -778,7 +1028,8 @@ void instrumentAddConstMem(const void* mem, size_t len, bool check_if_ro) {
     if (len <= 1) {
         return;
     }
-    if (!instrumentLimitEvery(127)) {
+
+    if (!instrumentLimitEvery(16383)) {
         return;
     }
     if (check_if_ro && util_getProgAddr(mem) == LHFC_ADDR_NOTFOUND) {
@@ -791,9 +1042,10 @@ void instrumentAddConstStr(const char* s) {
     if (!globalCmpFeedback) {
         return;
     }
-    if (!instrumentLimitEvery(127)) {
+    if (!instrumentLimitEvery(16383)) {
         return;
     }
+
     /*
      * if (len <= 1)
      */
@@ -813,7 +1065,7 @@ void instrumentAddConstStrN(const char* s, size_t n) {
     if (n <= 1) {
         return;
     }
-    if (!instrumentLimitEvery(127)) {
+    if (!instrumentLimitEvery(16383)) {
         return;
     }
     if (util_getProgAddr(s) == LHFC_ADDR_NOTFOUND) {

@@ -34,6 +34,19 @@
 #include <string.h>
 #if !defined(__sun)
 #include <sys/cdefs.h>
+#else
+#include <kvm.h>
+#include <sys/proc.h>
+#endif
+#if defined(__FreeBSD__)
+#include <sys/procctl.h>
+#endif
+#if defined(__APPLE__)
+#include <spawn.h>
+extern char** environ;
+#ifndef _POSIX_SPAWN_DISABLE_ASLR
+#define _POSIX_SPAWN_DISABLE_ASLR 0x0100
+#endif
 #endif
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -155,6 +168,8 @@ static void arch_analyzeSignal(run_t* run, pid_t pid, int status) {
             localtmstr, (int)pid, run->global->io.fileExtn);
     }
 
+    ATOMIC_POST_INC(run->global->cnts.crashesCnt);
+
     if (files_exists(run->crashFileName)) {
         LOG_I("Crash (dup): '%s' already exists, skipping", run->crashFileName);
         /* Clear filename so that verifier can understand we hit a duplicate */
@@ -164,7 +179,6 @@ static void arch_analyzeSignal(run_t* run, pid_t pid, int status) {
 
     LOG_I("Ok, that's interesting, saving input '%s'", run->crashFileName);
 
-    ATOMIC_POST_INC(run->global->cnts.crashesCnt);
     ATOMIC_POST_INC(run->global->cnts.uniqueCrashesCnt);
     /* If unique crash found, reset dynFile counter */
     ATOMIC_CLEAR(run->global->cfg.dynFileIterExpire);
@@ -178,10 +192,72 @@ static void arch_analyzeSignal(run_t* run, pid_t pid, int status) {
 }
 
 pid_t arch_fork(run_t* fuzzer HF_ATTR_UNUSED) {
+#if defined(__FreeBSD__)
+    const int flags = RFPROC | RFCFDG;
+    return rfork(flags);
+#else
     return fork();
+#endif
 }
 
 bool arch_launchChild(run_t* run) {
+#if defined(__APPLE__)
+    posix_spawnattr_t attrs;
+    posix_spawnattr_init(&attrs);
+
+    short ps_flags = POSIX_SPAWN_SETEXEC;
+    if (run->global->arch_linux.disableRandomization) {
+        ps_flags |= _POSIX_SPAWN_DISABLE_ASLR;
+    }
+
+    int ret = posix_spawnattr_setflags(&attrs, ps_flags);
+    if (ret != 0) {
+        LOG_W("cannot set posix_spawn flags");
+    }
+
+    int status = posix_spawn(NULL, run->args[0], NULL, &attrs, (char* const*)run->args, environ);
+
+    posix_spawnattr_destroy(&attrs);
+
+    if (status != 0) {
+        PLOG_E("posix_spawnp failed for '%s'", run->args[0]);
+        return false;
+    }
+#elif defined(__FreeBSD__)
+    int enableTrace          = PROC_TRACE_CTL_ENABLE;
+    int disableRandomization = PROC_ASLR_FORCE_DISABLE;
+    if (procctl(P_PID, 0, PROC_TRACE_CTL, &enableTrace) == -1) {
+        PLOG_E("procctl(PROC_TRACE_CTL, PROC_TRACE_CTL_ENABLE)");
+        return false;
+    }
+
+    if (run->global->arch_linux.disableRandomization &&
+        procctl(P_PID, 0, PROC_ASLR_CTL, &disableRandomization) == -1) {
+        PLOG_D("procctl(PROC_ASLR_CTL, PROC_ASLR_FORCE_DISABLE) failed");
+    }
+#elif defined(__sun)
+    if (run->global->arch_linux.disableRandomization) {
+        kvm_t*  hd          = NULL;
+        proc_t* cur         = NULL;
+        int     enableTrace = PROC_SEC_ASLR;
+        if ((hd = kvm_open(NULL, NULL, NULL, O_RDWR, NULL)) == NULL) {
+            PLOG_E("kvm_open() failed");
+            return false;
+        }
+
+        // unlikely but who knows
+        if ((cur = kvm_getproc(hd, getpid())) == NULL) {
+            PLOG_E("kvm_getproc() failed");
+            kvm_close(hd);
+            return false;
+        }
+        if (secflag_isset(cur->p_secflags.psf_effective, enableTrace)) {
+            secflag_clear(&cur->p_secflags.psf_effective, enableTrace);
+        }
+        kvm_close(hd);
+    }
+
+#endif
     /* alarm persists across forks, so disable it here */
     alarm(0);
     execvp(run->args[0], (char* const*)run->args);
@@ -263,6 +339,17 @@ void arch_reapChild(run_t* run) {
     }
 }
 
+void arch_reapKill(void) {
+#if defined(__FreeBSD__)
+    struct procctl_reaper_kill lst;
+    lst.rk_flags = 0;
+    lst.rk_sig   = SIGTERM;
+    if (procctl(P_PID, getpid(), PROC_REAP_KILL, &lst) == -1) {
+        PLOG_W("procctl(PROC_REAP_KILL)");
+    }
+#endif
+}
+
 bool arch_archInit(honggfuzz_t* hfuzz HF_ATTR_UNUSED) {
     /* Make %'d work */
     setlocale(LC_NUMERIC, "en_US.UTF-8");
@@ -271,5 +358,10 @@ bool arch_archInit(honggfuzz_t* hfuzz HF_ATTR_UNUSED) {
 }
 
 bool arch_archThreadInit(run_t* fuzzer HF_ATTR_UNUSED) {
+#if defined(__FreeBSD_)
+    if (procctl(P_PID, getpid(), PROC_REAP_ACQUIRE, NULL) == -1) {
+        PLOG_W("procctl(PROC_REAP_ACQUIRE)");
+    }
+#endif
     return true;
 }

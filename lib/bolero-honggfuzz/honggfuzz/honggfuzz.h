@@ -39,7 +39,7 @@
 #include "libhfcommon/util.h"
 
 #define PROG_NAME    "honggfuzz"
-#define PROG_VERSION "2.5"
+#define PROG_VERSION "2.6"
 
 /* Name of the template which will be replaced with the proper name of the file */
 #define _HF_FILE_PLACEHOLDER "___FILE___"
@@ -71,11 +71,14 @@
 /* Maximum number of PC guards (=trace-pc-guard) we support */
 #define _HF_PC_GUARD_MAX (1024ULL * 1024ULL * 64ULL)
 
-/* Maximum size of the input file in bytes (1 MiB) */
-#define _HF_INPUT_MAX_SIZE (1024ULL * 1024ULL)
+/* Maximum size of the input file in bytes (8 MiB) */
+#define _HF_INPUT_MAX_SIZE (1024ULL * 1024ULL * 8ULL)
 
 /* Default maximum size of produced inputs */
 #define _HF_INPUT_DEFAULT_SIZE (1024ULL * 8)
+
+/* Time (seconds) between checking dynamic input directory to import files */
+#define _HF_SYNC_TIME 1
 
 /* Per-thread bitmap */
 #define _HF_PERTHREAD_BITMAP_FD 1018
@@ -150,10 +153,21 @@ struct _dynfile_t {
     size_t             idx;
     int                fd;
     uint64_t           timeExecUSecs;
+    time_t             timeAdded; /* When this input was added to corpus */
     char               path[PATH_MAX];
     struct _dynfile_t* src;
     uint32_t           refs;
+    uint32_t           newEdges;    /* New edges discovered when added */
+    uint32_t           depth;       /* Mutation depth from seed */
+    uint64_t           stackDepth;  /* Max stack depth observed */
+    uint64_t           pathHash;    /* Hash of execution path for diversity */
+    uint32_t           selectCnt;   /* Times this input was selected */
+    uint32_t           cmpProgress; /* Comparison progress score */
+    uint16_t           rareEdgeCnt; /* Count of rare edges this input hits */
+    fuzzState_t        phase;
+    bool               timedout;
     uint8_t*           data;
+    bool               imported;
     TAILQ_ENTRY(_dynfile_t) pointers;
 };
 
@@ -165,26 +179,59 @@ struct strings_t {
     char s[];
 };
 
+/* Cache-line padded counters to avoid false sharing between threads */
+#define _HF_CACHE_LINE_SZ 64
+typedef struct {
+    uint64_t val;
+    uint8_t  _pad[_HF_CACHE_LINE_SZ - sizeof(uint64_t)];
+} __attribute__((aligned(_HF_CACHE_LINE_SZ))) cntCacheLine_t;
+
+typedef struct {
+    size_t  val;
+    uint8_t _pad[_HF_CACHE_LINE_SZ - sizeof(size_t)];
+} __attribute__((aligned(_HF_CACHE_LINE_SZ))) sizeCacheLine_t;
+
+typedef struct {
+    bool    val;
+    uint8_t _pad[_HF_CACHE_LINE_SZ - sizeof(bool)];
+} __attribute__((aligned(_HF_CACHE_LINE_SZ))) boolCacheLine_t;
+
 typedef struct {
     uint8_t  pcGuardMap[_HF_PC_GUARD_MAX];
     uint8_t  bbMapPc[_HF_PERF_BITMAP_SIZE_16M];
     uint32_t bbMapCmp[_HF_PERF_BITMAP_SIZE_16M];
-    uint64_t pidNewPC[_HF_THREAD_MAX];
-    uint64_t pidNewEdge[_HF_THREAD_MAX];
-    uint64_t pidNewCmp[_HF_THREAD_MAX];
     uint64_t guardNb;
-    uint64_t pidTotalPC[_HF_THREAD_MAX];
-    uint64_t pidTotalEdge[_HF_THREAD_MAX];
-    uint64_t pidTotalCmp[_HF_THREAD_MAX];
+    /* Per-thread counters - cache-line padded to avoid false sharing */
+    cntCacheLine_t  pidNewPC[_HF_THREAD_MAX];
+    cntCacheLine_t  pidNewEdge[_HF_THREAD_MAX];
+    cntCacheLine_t  pidNewCmp[_HF_THREAD_MAX];
+    cntCacheLine_t  pidTotalPC[_HF_THREAD_MAX];
+    cntCacheLine_t  pidTotalEdge[_HF_THREAD_MAX];
+    cntCacheLine_t  pidTotalCmp[_HF_THREAD_MAX];
+    sizeCacheLine_t maxStackDepth[_HF_THREAD_MAX];
+    sizeCacheLine_t pidLastStackDepth[_HF_THREAD_MAX];
+    boolCacheLine_t pidNewStackDepth[_HF_THREAD_MAX];
+    cntCacheLine_t  pidPathHash[_HF_THREAD_MAX];    /* Execution path hash */
+    cntCacheLine_t  pidCmpProgress[_HF_THREAD_MAX]; /* CMP solving progress */
+    cntCacheLine_t  pidRareEdgeCnt[_HF_THREAD_MAX]; /* Rare edges hit this run */
+    /* Global edge frequency tracking - indexed by (guard % size) */
+    uint8_t edgeHitCnt[65536];
 } feedback_t;
 
 typedef struct {
-    uint32_t cnt;
-    struct {
-        uint8_t  val[32];
-        uint32_t len;
-    } valArr[1024 * 16];
-} cmpfeedback_t;
+    uint8_t  val[64];
+    uint32_t len;
+} dict_entry_t;
+
+typedef struct {
+    dict_entry_t dict[1024 * 32];
+    uint32_t     dictCnt;
+    uint32_t     dictStaticCnt;
+    uint32_t     ro32[1024 * 128];
+    uint32_t     ro32Cnt;
+    uint64_t     ro64[1024 * 128];
+    uint32_t     ro64Cnt;
+} fuzz_data_t;
 
 typedef struct {
     struct {
@@ -212,10 +259,15 @@ typedef struct {
         bool        saveSmaller;
         size_t      dynfileqMaxSz;
         size_t      dynfileqCnt;
+        size_t      dynfileqId;
         dynfile_t*  dynfileqCurrent;
         dynfile_t*  dynfileq2Current;
+        dynfile_t*  dynfileqDiverseCurrent;
         TAILQ_HEAD(dyns_t, _dynfile_t) dynfileq;
-        bool exportFeedback;
+        bool        exportFeedback;
+        const char* dynamicInputDir;
+        const char* statsFileName;
+        int         statsFileFd;
     } io;
     struct {
         int                argc;
@@ -242,6 +294,7 @@ typedef struct {
         time_t  runEndTime;
         time_t  tmOut;
         time_t  lastCovUpdate;
+        time_t  exitOnTime;
         int64_t timeOfLongestUnitUSecs;
         bool    tmoutVTALRM;
     } timing;
@@ -255,6 +308,11 @@ typedef struct {
         size_t      mutationsMax;
         unsigned    mutationsPerRun;
         size_t      maxInputSz;
+        /* Mutation effectiveness tracking */
+        struct {
+            uint64_t tries;     /* Number of times this tier was used */
+            uint64_t successes; /* Number of times it led to new coverage */
+        } stats[4];             /* 0=data, 1=arith, 2=splice, 3=other */
     } mutate;
     struct {
         bool    useScreen;
@@ -279,9 +337,8 @@ typedef struct {
         fuzzState_t     state;
         feedback_t*     covFeedbackMap;
         int             covFeedbackFd;
-        cmpfeedback_t*  cmpFeedbackMap;
+        fuzz_data_t*    cmpFeedbackMap;
         int             cmpFeedbackFd;
-        bool            cmpFeedback;
         const char*     blocklistFile;
         uint64_t*       blocklist;
         size_t          blocklistCnt;
@@ -289,6 +346,7 @@ typedef struct {
         uint64_t        maxCov[4];
         dynFileMethod_t dynFileMethod;
         hwcnt_t         hwCnts;
+        uint64_t        uniquePaths; /* Count of unique execution paths seen */
     } feedback;
     struct {
         size_t mutationsCnt;
@@ -370,10 +428,8 @@ typedef struct {
     int          perThreadCovFeedbackFd;
     unsigned     triesLeft;
     dynfile_t*   current;
-#if !defined(_HF_ARCH_DARWIN)
-    timer_t timerId;
-#endif    // !defined(_HF_ARCH_DARWIN)
-    hwcnt_t hwCnts;
+    hwcnt_t      hwCnts;
+    uint8_t      mutationTiers; /* Bitmap of mutation tiers used this run */
 
     struct {
         /* For Linux code */

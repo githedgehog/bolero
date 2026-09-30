@@ -47,7 +47,6 @@
 #include "pt.h"
 
 #define _HF_PERF_MAP_SZ (1024 * 512)
-#define _HF_PERF_AUX_SZ (1024 * 1024)
 /* PERF_TYPE for Intel_PT/BTS -1 if none */
 static int32_t perfIntelPtPerfType  = -1;
 static int32_t perfIntelBtsPerfType = -1;
@@ -99,6 +98,11 @@ static inline void arch_perfMmapParse(run_t* run HF_ATTR_UNUSED) {
     if (pem->aux_head < pem->aux_tail) {
         LOG_F("The PERF AUX data has been overwritten. The AUX buffer is too small");
     }
+    if (pem->aux_head > _HF_PERF_AUX_SZ) {
+        LOG_W("The PERF AUX data (%lu) is larger than the buffer size (%u). Skipping analysis.",
+            (unsigned long)pem->aux_head, _HF_PERF_AUX_SZ);
+        return;
+    }
     if (run->global->feedback.dynFileMethod & _HF_DYNFILE_BTS_EDGE) {
         arch_perfBtsCount(run);
     }
@@ -128,9 +132,8 @@ static bool arch_perfCreate(run_t* run, pid_t pid, dynFileMethod_t method, int* 
         LOG_F("Intel PT events are not supported on this platform");
     }
 
-    struct perf_event_attr pe;
-    memset(&pe, 0, sizeof(struct perf_event_attr));
-    pe.size = sizeof(struct perf_event_attr);
+    struct perf_event_attr pe = {};
+    pe.size                   = sizeof(struct perf_event_attr);
     if (run->global->arch_linux.kernelOnly) {
         pe.exclude_user = 1;
     } else {
@@ -144,29 +147,29 @@ static bool arch_perfCreate(run_t* run, pid_t pid, dynFileMethod_t method, int* 
     pe.type       = PERF_TYPE_HARDWARE;
 
     switch (method) {
-        case _HF_DYNFILE_INSTR_COUNT:
-            LOG_D("Using: PERF_COUNT_HW_INSTRUCTIONS for pid=%d", (int)pid);
-            pe.config  = PERF_COUNT_HW_INSTRUCTIONS;
-            pe.inherit = 1;
-            break;
-        case _HF_DYNFILE_BRANCH_COUNT:
-            LOG_D("Using: PERF_COUNT_HW_BRANCH_INSTRUCTIONS for pid=%d", (int)pid);
-            pe.config  = PERF_COUNT_HW_BRANCH_INSTRUCTIONS;
-            pe.inherit = 1;
-            break;
-        case _HF_DYNFILE_BTS_EDGE:
-            LOG_D("Using: (Intel BTS) type=%" PRIu32 " for pid=%d", perfIntelBtsPerfType, (int)pid);
-            pe.type = perfIntelBtsPerfType;
-            break;
-        case _HF_DYNFILE_IPT_BLOCK:
-            LOG_D("Using: (Intel PT) type=%" PRIu32 " for pid=%d", perfIntelPtPerfType, (int)pid);
-            pe.type   = perfIntelPtPerfType;
-            pe.config = RTIT_CTL_DISRETC;
-            break;
-        default:
-            LOG_E("Unknown perf mode: '%d' for pid=%d", method, (int)pid);
-            return false;
-            break;
+    case _HF_DYNFILE_INSTR_COUNT:
+        LOG_D("Using: PERF_COUNT_HW_INSTRUCTIONS for pid=%d", (int)pid);
+        pe.config  = PERF_COUNT_HW_INSTRUCTIONS;
+        pe.inherit = 1;
+        break;
+    case _HF_DYNFILE_BRANCH_COUNT:
+        LOG_D("Using: PERF_COUNT_HW_BRANCH_INSTRUCTIONS for pid=%d", (int)pid);
+        pe.config  = PERF_COUNT_HW_BRANCH_INSTRUCTIONS;
+        pe.inherit = 1;
+        break;
+    case _HF_DYNFILE_BTS_EDGE:
+        LOG_D("Using: (Intel BTS) type=%" PRIu32 " for pid=%d", perfIntelBtsPerfType, (int)pid);
+        pe.type = perfIntelBtsPerfType;
+        break;
+    case _HF_DYNFILE_IPT_BLOCK:
+        LOG_D("Using: (Intel PT) type=%" PRIu32 " for pid=%d", perfIntelPtPerfType, (int)pid);
+        pe.type   = perfIntelPtPerfType;
+        pe.config = RTIT_CTL_DISRETC;
+        break;
+    default:
+        LOG_E("Unknown perf mode: '%d' for pid=%d", method, (int)pid);
+        return false;
+        break;
     }
 
 #if !defined(PERF_FLAG_FD_CLOEXEC)

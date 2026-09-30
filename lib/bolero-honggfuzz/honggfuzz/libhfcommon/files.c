@@ -21,7 +21,7 @@
  *
  */
 
-#include "libhfcommon/files.h"
+#include "files.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -50,9 +50,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "libhfcommon/common.h"
-#include "libhfcommon/log.h"
-#include "libhfcommon/util.h"
+#include "common.h"
+#include "log.h"
+#include "util.h"
 
 ssize_t files_readFileToBufMax(const char* fname, uint8_t* buf, size_t fileMaxSz) {
     int fd = TEMP_FAILURE_RETRY(open(fname, O_RDONLY | O_CLOEXEC));
@@ -63,7 +63,7 @@ ssize_t files_readFileToBufMax(const char* fname, uint8_t* buf, size_t fileMaxSz
 
     ssize_t readSz = files_readFromFd(fd, buf, fileMaxSz);
     if (readSz < 0) {
-        LOG_W("Couldn't read '%s' to a buf", fname);
+        PLOG_W("Couldn't read '%s' to a buf (size=%zu)", fname, fileMaxSz);
     }
     close(fd);
 
@@ -150,11 +150,19 @@ ssize_t files_readFromFd(int fd, uint8_t* buf, size_t fileSz) {
 }
 
 ssize_t files_readFromFdSeek(int fd, uint8_t* buf, size_t fileSz, off_t off) {
-    if (lseek(fd, (off_t)0, SEEK_SET) == (off_t)-1) {
-        PLOG_W("lseek(fd=%d, %lld, SEEK_SET)", fd, (long long int)off);
-        return -1;
+    size_t readSz = 0;
+    while (readSz < fileSz) {
+        ssize_t sz =
+            TEMP_FAILURE_RETRY(pread(fd, &buf[readSz], fileSz - readSz, off + (off_t)readSz));
+        if (sz == 0) {
+            break;
+        }
+        if (sz < 0) {
+            return -1;
+        }
+        readSz += sz;
     }
-    return files_readFromFd(fd, buf, fileSz);
+    return (ssize_t)readSz;
 }
 
 bool files_exists(const char* fname) {
@@ -223,11 +231,11 @@ bool files_resetFile(int fd, size_t sz) {
 #endif /* defined(_HF_ARCH_LINUX) */
 
     /* Fallback mode */
-    if (ftruncate(fd, (off_t)0) == -1) {
+    if (TEMP_FAILURE_RETRY(ftruncate(fd, (off_t)0)) == -1) {
         PLOG_W("ftruncate(fd=%d, sz=0)", fd);
         return false;
     }
-    if (ftruncate(fd, (off_t)sz) == -1) {
+    if (TEMP_FAILURE_RETRY(ftruncate(fd, (off_t)sz)) == -1) {
         PLOG_W("ftruncate(fd=%d, sz=%zu)", fd, sz);
         return false;
     }

@@ -30,6 +30,7 @@
 #include "libhfcommon/common.h"
 #include "libhfcommon/log.h"
 #include "libhfcommon/util.h"
+#include "linux/perf.h"
 
 #ifdef _HF_LINUX_INTEL_PT_LIB
 
@@ -44,7 +45,7 @@ struct pt_cpu ptCpu = {
 
 void perf_ptInit(void) {
     FILE* f = fopen("/proc/cpuinfo", "rb");
-    if (!f) {
+    if (UNLIKELY(!f)) {
         PLOG_E("Couldn't open '/proc/cpuinfo'");
         return;
     }
@@ -101,23 +102,23 @@ __attribute__((hot)) inline static void perf_ptAnalyzePkt(
 
     uint64_t ip;
     switch (packet->payload.ip.ipc) {
-        case pt_ipc_update_16:
-            ip = (*last_tip_ip & ~0xFFFFull) | (packet->payload.ip.ip & 0xFFFFull);
-            break;
-        case pt_ipc_update_32:
-            ip = (*last_tip_ip & ~0xFFFFFFFFull) | (packet->payload.ip.ip & 0xFFFFFFFFull);
-            break;
-        case pt_ipc_update_48:
-            ip = (*last_tip_ip & ~0xFFFFFFFFFFFFull) | (packet->payload.ip.ip & 0xFFFFFFFFFFFFull);
-            break;
-        case pt_ipc_sext_48:
-            ip = sext(packet->payload.ip.ip, 48);
-            break;
-        case pt_ipc_full:
-            ip = packet->payload.ip.ip;
-            break;
-        default:
-            return;
+    case pt_ipc_update_16:
+        ip = (*last_tip_ip & ~0xFFFFull) | (packet->payload.ip.ip & 0xFFFFull);
+        break;
+    case pt_ipc_update_32:
+        ip = (*last_tip_ip & ~0xFFFFFFFFull) | (packet->payload.ip.ip & 0xFFFFFFFFull);
+        break;
+    case pt_ipc_update_48:
+        ip = (*last_tip_ip & ~0xFFFFFFFFFFFFull) | (packet->payload.ip.ip & 0xFFFFFFFFFFFFull);
+        break;
+    case pt_ipc_sext_48:
+        ip = sext(packet->payload.ip.ip, 48);
+        break;
+    case pt_ipc_full:
+        ip = packet->payload.ip.ip;
+        break;
+    default:
+        return;
     }
 
     *last_tip_ip = ip;
@@ -142,6 +143,12 @@ void arch_ptAnalyze(run_t* run) {
 
     uint64_t aux_tail = ATOMIC_GET(pem->aux_tail);
     uint64_t aux_head = ATOMIC_GET(pem->aux_head);
+
+    if (aux_head > _HF_PERF_AUX_SZ) {
+        LOG_W("The PERF AUX data (%lu) is larger than the buffer size (%u). Skipping PT analysis.",
+            (unsigned long)aux_head, _HF_PERF_AUX_SZ);
+        return;
+    }
 
     /* smp_rmb() required as per /usr/include/linux/perf_event.h */
     rmb();

@@ -19,7 +19,7 @@ __attribute__((used)) const char* const LIBHFUZZ_module_memorycmp = "LIBHFUZZ_mo
  * util_getProgAddr() check is quite costly, and it lowers the fuzzing speed typically by a factor
  * of 2, but keep it true for now
  */
-#define HF_TEST_ADDR_CMPHASH true
+#define HF_TEST_ADDR_CMPHASH false
 
 static inline uintptr_t HF_cmphash(uintptr_t addr, const void* s1, const void* s2) {
     if (HF_TEST_ADDR_CMPHASH && util_getProgAddr(s1) != LHFC_ADDR_NOTFOUND) {
@@ -196,6 +196,99 @@ static inline char* HF_strcpy(char* dest, const char* src, uintptr_t addr) {
     return __builtin_memcpy(dest, src, len + 1);
 }
 
+static inline char* HF_strcat(char* dest, const char* src, uintptr_t addr) {
+    size_t len = __builtin_strlen(dest);
+    HF_strcpy(dest + len, src, addr);
+    return dest;
+}
+
+static inline size_t HF_strlcpy(char* dest, const char* src, size_t sz, uintptr_t addr) {
+    size_t slen = __builtin_strlen(src);
+    size_t len  = sz < slen ? sz : slen;
+
+    if (sz == 0) {
+        return slen;
+    }
+    /* Make space for NUL at the end of the string.
+     * sz != 0 here
+     */
+    if (len == sz) {
+        len--;
+    }
+
+    if (len > 0) {
+        instrumentUpdateCmpMap(addr, util_Log2(len));
+        (void)__builtin_memcpy(dest, src, len);
+    }
+
+    dest[len] = '\0';
+    return slen;
+}
+
+static inline size_t HF_strlcat(char* dest, const char* src, size_t sz, uintptr_t addr) {
+    size_t dstlen = __builtin_strlen(dest);
+
+    if (dstlen >= sz) {
+        return dstlen + __builtin_strlen(src);
+    }
+
+    size_t left = sz - dstlen;
+
+    return dstlen + HF_strlcpy(dest + dstlen, src, left, addr);
+}
+
+static inline size_t HF_strspn(const char* s, const char* accept, uintptr_t addr) {
+    size_t ret = 0;
+    while (s[ret] != '\0' && __builtin_strchr(accept, s[ret])) {
+        ret++;
+    }
+    instrumentUpdateCmpMap(addr, ret);
+    instrumentAddConstStr(accept);
+    return ret;
+}
+
+static inline size_t HF_strcspn(const char* s, const char* reject, uintptr_t addr) {
+    size_t ret = 0;
+    while (s[ret] != '\0' && !__builtin_strchr(reject, s[ret])) {
+        ret++;
+    }
+    instrumentUpdateCmpMap(addr, ret);
+    instrumentAddConstStr(reject);
+    return ret;
+}
+
+static inline char* HF_strpbrk(const char* s, const char* accept, uintptr_t addr) {
+    char* ret = NULL;
+    for (const char* p = s; *p != '\0'; p++) {
+        if (__builtin_strchr(accept, *p)) {
+            ret = (char*)p;
+            break;
+        }
+    }
+
+    if (ret) {
+        size_t off = (size_t)(ret - s);
+        instrumentUpdateCmpMap(addr, off);
+    }
+    instrumentAddConstStr(accept);
+    return ret;
+}
+
+static inline char* HF_strncat(char* dest, const char* src, size_t n, uintptr_t addr) {
+    size_t dlen = __builtin_strlen(dest);
+    size_t slen = __builtin_strlen(src);
+    size_t len  = slen < n ? slen : n;
+
+    if (len > 0) {
+        instrumentUpdateCmpMap(addr, util_Log2(len));
+        instrumentAddConstMem(src, len, /* check_if_ro= */ true);
+    }
+
+    __builtin_memcpy(dest + dlen, src, len);
+    dest[dlen + len] = '\0';
+    return dest;
+}
+
 /* Define a weak function x, as well as __wrap_x pointing to x */
 #define XVAL(x) x
 #define HF_WEAK_WRAP(ret, func, ...)                                                               \
@@ -289,6 +382,55 @@ HF_WEAK_WRAP(char*, strcpy, char* dest, const char* src) {
 void __sanitizer_weak_hook_strcpy(
     uintptr_t pc, char* dest, const char* src, char* result HF_ATTR_UNUSED) {
     HF_strcpy(dest, src, pc);
+}
+HF_WEAK_WRAP(char*, strcat, char* dest, const char* src) {
+    return HF_strcat(dest, src, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strcat(
+    uintptr_t pc, char* dest, const char* src, char* result HF_ATTR_UNUSED) {
+    HF_strcat(dest, src, pc);
+}
+HF_WEAK_WRAP(size_t, strlcpy, char* dest, const char* src, size_t len) {
+    return HF_strlcpy(dest, src, len, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strlcpy(
+    uintptr_t pc, char* dest, const char* src, size_t sz, size_t result HF_ATTR_UNUSED) {
+    HF_strlcpy(dest, src, sz, pc);
+}
+HF_WEAK_WRAP(size_t, strlcat, char* dest, const char* src, size_t len) {
+    return HF_strlcat(dest, src, len, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strlcat(
+    uintptr_t pc, char* dest, const char* src, size_t sz, size_t result HF_ATTR_UNUSED) {
+    HF_strlcat(dest, src, sz, pc);
+}
+HF_WEAK_WRAP(size_t, strspn, const char* s, const char* accept) {
+    return HF_strspn(s, accept, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strspn(
+    uintptr_t pc, const char* s, const char* accept, size_t result HF_ATTR_UNUSED) {
+    HF_strspn(s, accept, pc);
+}
+HF_WEAK_WRAP(size_t, strcspn, const char* s, const char* reject) {
+    return HF_strcspn(s, reject, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strcspn(
+    uintptr_t pc, const char* s, const char* reject, size_t result HF_ATTR_UNUSED) {
+    HF_strcspn(s, reject, pc);
+}
+HF_WEAK_WRAP(char*, strpbrk, const char* s, const char* accept) {
+    return HF_strpbrk(s, accept, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strpbrk(
+    uintptr_t pc, const char* s, const char* accept, char* result HF_ATTR_UNUSED) {
+    HF_strpbrk(s, accept, pc);
+}
+HF_WEAK_WRAP(char*, strncat, char* dest, const char* src, size_t n) {
+    return HF_strncat(dest, src, n, (uintptr_t)__builtin_return_address(0));
+}
+void __sanitizer_weak_hook_strncat(
+    uintptr_t pc, char* dest, const char* src, size_t n, char* result HF_ATTR_UNUSED) {
+    HF_strncat(dest, src, n, pc);
 }
 
 /*
@@ -466,7 +608,7 @@ HF_WEAK_WRAP(bool, strcsequal, const void* s1, const void* s2) {
 /*
  * LittleCMS wrappers
  */
-HF_WEAK_WRAP(int, cmsstrcasecmp, const void* s1, const void* s2) {
+HF_WEAK_WRAP(int, cmsstrcasecmp, const char* s1, const char* s2) {
     return HF_strcasecmp(s1, s2, toupper, (uintptr_t)__builtin_return_address(0));
 }
 
@@ -509,7 +651,7 @@ HF_WEAK_WRAP(char*, g_strstr_len, const char* haystack, ssize_t haystack_len, co
         (uintptr_t)__builtin_return_address(0));
 }
 
-static inline int hf_glib_ascii_tolower(int c) {
+static inline int hf_ascii_tolower(int c) {
     if (c >= 'A' && c <= 'Z') {
         return c - 'A' + 'a';
     }
@@ -520,14 +662,14 @@ HF_WEAK_WRAP(int, g_ascii_strcasecmp, const char* s1, const char* s2) {
     if (!s1 || !s2) {
         return 0;
     }
-    return HF_strcasecmp(s1, s2, hf_glib_ascii_tolower, (uintptr_t)__builtin_return_address(0));
+    return HF_strcasecmp(s1, s2, hf_ascii_tolower, (uintptr_t)__builtin_return_address(0));
 }
 
 HF_WEAK_WRAP(int, g_ascii_strncasecmp, const char* s1, const char* s2, size_t n) {
     if (!s1 || !s2) {
         return 0;
     }
-    return HF_strncasecmp(s1, s2, n, hf_glib_ascii_tolower, instrumentConstAvail(),
+    return HF_strncasecmp(s1, s2, n, hf_ascii_tolower, instrumentConstAvail(),
         (uintptr_t)__builtin_return_address(0));
 }
 
@@ -604,7 +746,61 @@ HF_WEAK_WRAP(int, curl_strnequal, const char* first, const char* second, size_t 
     return 0;
 }
 
+/* SQLite3 wrappers */
+HF_WEAK_WRAP(int, sqlite3_stricmp, const char* s1, const char* s2) {
+    return HF_strcasecmp(s1, s2, tolower, (uintptr_t)__builtin_return_address(0));
+}
+HF_WEAK_WRAP(int, sqlite3StrICmp, const char* s1, const char* s2) {
+    return HF_strcasecmp(s1, s2, tolower, (uintptr_t)__builtin_return_address(0));
+}
+HF_WEAK_WRAP(int, sqlite3_strnicmp, const char* s1, const char* s2, size_t len) {
+    return HF_strncasecmp(
+        s1, s2, len, tolower, /* constfb= */ true, (uintptr_t)__builtin_return_address(0));
+}
+
 /* C++ wrappers */
 int _ZNSt11char_traitsIcE7compareEPKcS2_m(const char* s1, const char* s2, size_t count) {
     return HF_memcmp(s1, s2, count, instrumentConstAvail(), (uintptr_t)__builtin_return_address(0));
+}
+
+/*
+ * FFmpeg wrappers
+ */
+HF_WEAK_WRAP(int, av_strcasecmp, const char* s1, const char* s2) {
+    return HF_strcasecmp(s1, s2, hf_ascii_tolower, (uintptr_t)__builtin_return_address(0));
+}
+
+HF_WEAK_WRAP(int, av_strncasecmp, const char* s1, const char* s2, size_t n) {
+    return HF_strncasecmp(s1, s2, n, hf_ascii_tolower, instrumentConstAvail(),
+        (uintptr_t)__builtin_return_address(0));
+}
+
+/*
+ * MbedTLS wrappers
+ */
+HF_WEAK_WRAP(int, mbedtls_ct_memcmp, const void* m1, const void* m2, size_t n) {
+    return HF_memcmp(m1, m2, n, instrumentConstAvail(), (uintptr_t)__builtin_return_address(0));
+}
+
+/*
+ * PostgreSQL wrappers
+ */
+HF_WEAK_WRAP(int, pg_strcasecmp, const char* s1, const char* s2) {
+    return HF_strcasecmp(s1, s2, hf_ascii_tolower, (uintptr_t)__builtin_return_address(0));
+}
+
+HF_WEAK_WRAP(int, pg_strncasecmp, const char* s1, const char* s2, size_t n) {
+    return HF_strncasecmp(s1, s2, n, hf_ascii_tolower, instrumentConstAvail(),
+        (uintptr_t)__builtin_return_address(0));
+}
+
+/*
+ * BSD/openssh wrappers
+ */
+HF_WEAK_WRAP(int, timingsafe_bcmp, const void* b1, const void* b2, size_t n) {
+    return HF_memcmp(b1, b2, n, instrumentConstAvail(), (uintptr_t)__builtin_return_address(0));
+}
+
+HF_WEAK_WRAP(int, timingsafe_memcmp, const void* b1, const void* b2, size_t n) {
+    return HF_memcmp(b1, b2, n, instrumentConstAvail(), (uintptr_t)__builtin_return_address(0));
 }

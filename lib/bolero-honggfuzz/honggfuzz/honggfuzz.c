@@ -23,17 +23,24 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__FreeBSD__)
+#include <sys/procctl.h>
+#endif
+
 #include "cmdline.h"
+#include "dict.h"
 #include "display.h"
 #include "fuzz.h"
 #include "input.h"
@@ -43,6 +50,10 @@
 #include "libhfcommon/util.h"
 #include "socketfuzzer.h"
 #include "subproc.h"
+
+#if defined(_HF_ARCH_LINUX) && !defined(_HF_LINUX_NO_BFD)
+#include "linux/bfd.h"
+#endif
 
 static int  sigReceived = 0;
 static bool clearWin    = false;
@@ -259,7 +270,14 @@ static uint8_t mainThreadLoop(honggfuzz_t* hfuzz) {
     setupSignalsMainThread();
     setupMainThreadTimer();
 
+    uint64_t dynamicQueuePollTime = time(NULL);
     for (;;) {
+        if (hfuzz->io.dynamicInputDir && time(NULL) - dynamicQueuePollTime > _HF_SYNC_TIME) {
+            LOG_D("Loading files from the dynamic input queue...");
+            input_enqueueDynamicInputs(hfuzz);
+            dynamicQueuePollTime = time(NULL);
+        }
+
         if (hfuzz->display.useScreen) {
             if (ATOMIC_XCHG(clearWin, false)) {
                 display_clear();
@@ -276,6 +294,12 @@ static uint8_t mainThreadLoop(honggfuzz_t* hfuzz) {
         }
         if (hfuzz->timing.runEndTime > 0 && (time(NULL) > hfuzz->timing.runEndTime)) {
             LOG_I("Maximum run time reached, terminating");
+            break;
+        }
+        if (hfuzz->timing.exitOnTime > 0 &&
+            time(NULL) - ATOMIC_GET(hfuzz->timing.lastCovUpdate) > hfuzz->timing.exitOnTime) {
+            LOG_I("No new coverage was found for the last %" PRIu64 " seconds, terminating",
+                (uint64_t)hfuzz->timing.exitOnTime);
             break;
         }
         pingThreads(hfuzz);
@@ -303,7 +327,7 @@ static const char* strYesNo(bool yes) {
 }
 
 static const char* getGitVersion() {
-    static char version[] = "$Id: 380cf14962c64e3fa902d9442b6c6513869116ed $";
+    static char version[] = "$Id: 01713bdad7307acea887517f2468b4a9961f9806 $";
     if (strlen(version) == 47) {
         version[45] = '\0';
         return &version[5];
@@ -371,6 +395,19 @@ int honggfuzz_main(int argc, char** argv) {
         LOG_F("Couldn't parse dictionary file ('%s')", hfuzz.mutate.dictionaryFile);
     }
 
+#if defined(_HF_ARCH_LINUX) && !defined(_HF_LINUX_NO_BFD)
+    /* Extract tokens from parser generator string arrays (Lemon/Bison/Yacc) */
+    arch_bfdExtractStrArray(&hfuzz, "yyTokenName"); /* Lemon */
+    arch_bfdExtractStrArray(&hfuzz, "yytname");     /* Bison/Yacc */
+    /* Scan .rodata for other string pointer arrays */
+    arch_bfdExtractRodataStrArrays(&hfuzz);
+#endif
+
+    /* Log dictionary stats after all sources have been processed */
+    if (hfuzz.mutate.dictionaryCnt > 0) {
+        dict_logStats(&hfuzz);
+    }
+
     if (hfuzz.feedback.blocklistFile && !input_parseBlacklist(&hfuzz)) {
         LOG_F("Couldn't parse stackhash blocklist file ('%s')", hfuzz.feedback.blocklistFile);
     }
@@ -391,12 +428,44 @@ int honggfuzz_main(int argc, char** argv) {
         LOG_F("files_mapSharedMem(name='hf-covfeddback', sz=%zu, dir='%s') failed",
             sizeof(feedback_t), hfuzz.io.workDir);
     }
-    if (hfuzz.feedback.cmpFeedback) {
-        if (!(hfuzz.feedback.cmpFeedbackMap = files_mapSharedMem(sizeof(cmpfeedback_t),
-                  &hfuzz.feedback.cmpFeedbackFd, "hf-cmpfeedback", /* nocore= */ true,
-                  /* export= */ hfuzz.io.exportFeedback))) {
-            LOG_F("files_mapSharedMem(name='hf-cmpfeedback', sz=%zu, dir='%s') failed",
-                sizeof(cmpfeedback_t), hfuzz.io.workDir);
+#if defined(_HF_ARCH_LINUX) && !defined(_HF_LINUX_NO_BFD)
+    arch_bfdExtractRodataStrArrays(&hfuzz);
+#endif
+    if (!(hfuzz.feedback.cmpFeedbackMap = files_mapSharedMem(sizeof(fuzz_data_t),
+              &hfuzz.feedback.cmpFeedbackFd, "hf-cmpfeedback", /* nocore= */ true,
+              /* export= */ hfuzz.io.exportFeedback))) {
+        LOG_F("files_mapSharedMem(name='hf-cmpfeedback', sz=%zu, dir='%s') failed",
+            sizeof(fuzz_data_t), hfuzz.io.workDir);
+    }
+    if (hfuzz.feedback.cmpFeedbackMap) {
+#if defined(_HF_ARCH_LINUX) && !defined(_HF_LINUX_NO_BFD)
+        arch_elfCollectRoValues(&hfuzz);
+#endif
+        for (size_t i = 0;
+            i < hfuzz.mutate.dictionaryCnt && i < ARRAYSIZE(hfuzz.feedback.cmpFeedbackMap->dict);
+            i++) {
+            size_t len = hfuzz.mutate.dictionary[i].len;
+            if (len > sizeof(hfuzz.feedback.cmpFeedbackMap->dict[i].val)) {
+                len = sizeof(hfuzz.feedback.cmpFeedbackMap->dict[i].val);
+            }
+            memcpy(hfuzz.feedback.cmpFeedbackMap->dict[i].val, hfuzz.mutate.dictionary[i].val, len);
+            hfuzz.feedback.cmpFeedbackMap->dict[i].len = len;
+        }
+        hfuzz.feedback.cmpFeedbackMap->dictCnt =
+            HF_MIN(hfuzz.mutate.dictionaryCnt, ARRAYSIZE(hfuzz.feedback.cmpFeedbackMap->dict));
+        hfuzz.feedback.cmpFeedbackMap->dictStaticCnt = hfuzz.feedback.cmpFeedbackMap->dictCnt;
+    }
+    /* Stats file. */
+    if (hfuzz.io.statsFileName) {
+        hfuzz.io.statsFileFd =
+            TEMP_FAILURE_RETRY(open(hfuzz.io.statsFileName, O_CREAT | O_RDWR | O_TRUNC, 0640));
+
+        if (hfuzz.io.statsFileFd == -1) {
+            PLOG_F("Couldn't open statsfile open('%s')", hfuzz.io.statsFileName);
+        } else {
+            dprintf(hfuzz.io.statsFileFd,
+                "# unix_time, last_cov_update, total_exec, exec_per_sec, "
+                "crashes, unique_crashes, hangs, edge_cov, block_cov, corpus_count\n");
         }
     }
 
@@ -432,6 +501,10 @@ int honggfuzz_main(int argc, char** argv) {
 #endif
     if (hfuzz.socketFuzzer.enabled) {
         cleanupSocketFuzzer();
+    }
+    /* Stats file. */
+    if (hfuzz.io.statsFileName) {
+        close(hfuzz.io.statsFileFd);
     }
 
     printSummary(&hfuzz);

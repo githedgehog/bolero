@@ -1,11 +1,11 @@
 /*
  *
- * honggfuzz - architecture dependent code
+ * honggfuzz - power schedule calculation
  * -----------------------------------------
  *
  * Author: Robert Swiecki <swiecki@google.com>
  *
- * Copyright 2010-2018 by Google Inc. All Rights Reserved.
+ * Copyright 2025 by Google Inc. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may
  * not use this file except in compliance with the License. You may obtain
@@ -21,13 +21,14 @@
  *
  */
 
-#ifndef _HF_LINUX_UNWIND_H_
-#define _HF_LINUX_UNWIND_H_
+#ifndef _HF_POWER_H_
+#define _HF_POWER_H_
 
-#include "sanitizers.h"
+#include "honggfuzz.h"
 
-extern size_t arch_unwindStack(pid_t pid, funcs_t* funcs);
-extern char*  arch_btContainsSymbol(
-    size_t symbolsListSz, char** symbolsList, size_t num_frames, funcs_t* funcs);
+/* The baseline energy level. Input with this energy will be fuzzed exactly once. */
+#define POWER_BASE_ENERGY 256
 
-#endif
+extern uint64_t power_calculateEnergy(run_t* run, dynfile_t* dynfile);
+
+#endif /* _HF_POWER_H_ */

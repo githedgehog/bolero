@@ -126,6 +126,8 @@ static void fuzz_setDynamicMainState(run_t* run) {
             .fd            = -1,
             .timeExecUSecs = 1,
             .path          = "[DYNAMIC-0-SIZE]",
+            .timedout      = false,
+            .imported      = false,
             .data          = (uint8_t*)"",
         };
         dynfile_t* tmp_dynfile = run->dynfile;
@@ -161,11 +163,12 @@ static void fuzz_minimizeRemoveFiles(run_t* run) {
         return;
     }
     for (;;) {
-        char fname[PATH_MAX];
-        if (!input_getNext(run, fname, /* rewind= */ false)) {
+        char   fname[PATH_MAX];
+        size_t len;
+        if (!input_getNext(run, fname, &len, /* rewind= */ false)) {
             break;
         }
-        if (!input_inDynamicCorpus(run, fname)) {
+        if (!input_inDynamicCorpus(run, fname, len)) {
             if (input_removeStaticFile(run->global->io.inputDir, fname)) {
                 LOG_I("Removed unnecessary '%s'", fname);
             }
@@ -178,38 +181,54 @@ static void fuzz_perfFeedback(run_t* run) {
     if (run->global->feedback.skipFeedbackOnTimeout && run->tmOutSignaled) {
         return;
     }
+    if (run->global->feedback.dynFileMethod == _HF_DYNFILE_NONE) {
+        return;
+    }
 
     MX_SCOPED_LOCK(&run->global->mutex.feedback);
     defer {
         wmb();
     };
 
-    uint64_t softNewPC = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidNewPC[run->fuzzNo]);
-    ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidNewPC[run->fuzzNo]);
-    uint64_t softCurPC = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidTotalPC[run->fuzzNo]);
-    ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidTotalPC[run->fuzzNo]);
+    uint64_t softNewPC         = 0;
+    uint64_t softCurPC         = 0;
+    uint64_t softNewEdge       = 0;
+    uint64_t softCurEdge       = 0;
+    uint64_t softNewCmp        = 0;
+    uint64_t softCurCmp        = 0;
+    bool     softNewStackDepth = false;
 
-    uint64_t softNewEdge =
-        ATOMIC_GET(run->global->feedback.covFeedbackMap->pidNewEdge[run->fuzzNo]);
-    ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidNewEdge[run->fuzzNo]);
-    uint64_t softCurEdge =
-        ATOMIC_GET(run->global->feedback.covFeedbackMap->pidTotalEdge[run->fuzzNo]);
-    ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidTotalEdge[run->fuzzNo]);
+    if (run->global->feedback.dynFileMethod & _HF_DYNFILE_SOFT) {
+        softNewPC = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidNewPC[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidNewPC[run->fuzzNo].val);
+        softCurPC = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidTotalPC[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidTotalPC[run->fuzzNo].val);
 
-    uint64_t softNewCmp = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidNewCmp[run->fuzzNo]);
-    ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidNewCmp[run->fuzzNo]);
-    uint64_t softCurCmp =
-        ATOMIC_GET(run->global->feedback.covFeedbackMap->pidTotalCmp[run->fuzzNo]);
-    ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidTotalCmp[run->fuzzNo]);
+        softNewEdge = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidNewEdge[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidNewEdge[run->fuzzNo].val);
+        softCurEdge =
+            ATOMIC_GET(run->global->feedback.covFeedbackMap->pidTotalEdge[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidTotalEdge[run->fuzzNo].val);
+
+        softNewCmp = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidNewCmp[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidNewCmp[run->fuzzNo].val);
+        softCurCmp = ATOMIC_GET(run->global->feedback.covFeedbackMap->pidTotalCmp[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidTotalCmp[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidLastStackDepth[run->fuzzNo].val);
+
+        softNewStackDepth = ATOMIC_XCHG(
+            run->global->feedback.covFeedbackMap->pidNewStackDepth[run->fuzzNo].val, false);
+    }
 
     rmb();
 
     int64_t diff0 = (int64_t)run->global->feedback.hwCnts.cpuInstrCnt - run->hwCnts.cpuInstrCnt;
     int64_t diff1 = (int64_t)run->global->feedback.hwCnts.cpuBranchCnt - run->hwCnts.cpuBranchCnt;
 
-    /* Any increase in coverage (edge, pc, cmp, hw) counters forces adding input to the corpus */
+    /* Any increase in coverage (edge, pc, cmp, hw, stack) counters forces adding input to the
+     * corpus */
     if (run->hwCnts.newBBCnt > 0 || softNewPC > 0 || softNewEdge > 0 || softNewCmp > 0 ||
-        diff0 < 0 || diff1 < 0) {
+        softNewStackDepth || diff0 < 0 || diff1 < 0) {
         if (diff0 < 0) {
             run->global->feedback.hwCnts.cpuInstrCnt = run->hwCnts.cpuInstrCnt;
         }
@@ -227,19 +246,96 @@ static void fuzz_perfFeedback(run_t* run) {
             run->dynfile->size, util_timeNowUSecs() - run->timeStartedUSecs,
             run->hwCnts.cpuInstrCnt, run->hwCnts.cpuBranchCnt, run->hwCnts.newBBCnt, softNewEdge,
             softNewPC, softNewCmp, run->hwCnts.cpuInstrCnt, run->hwCnts.cpuBranchCnt,
-            run->hwCnts.bbCnt, softCurEdge, softCurPC, softCurCmp);
+            run->global->feedback.hwCnts.bbCnt, run->global->feedback.hwCnts.softCntEdge,
+            run->global->feedback.hwCnts.softCntPc, run->global->feedback.hwCnts.softCntCmp);
+
+        if (run->global->io.statsFileName) {
+            const time_t curr_sec      = time(NULL);
+            const time_t elapsed_sec   = curr_sec - run->global->timing.timeStart;
+            size_t       curr_exec_cnt = ATOMIC_GET(run->global->cnts.mutationsCnt);
+            /*
+             * We increase the mutation counter unconditionally in threads, but if it's
+             * above hfuzz->mutationsMax we don't really execute the fuzzing loop.
+             * Therefore at the end of fuzzing, the mutation counter might be higher
+             * than hfuzz->mutationsMax
+             */
+            if (run->global->mutate.mutationsMax > 0 &&
+                curr_exec_cnt > run->global->mutate.mutationsMax) {
+                curr_exec_cnt = run->global->mutate.mutationsMax;
+            }
+            size_t tot_exec_per_sec = elapsed_sec ? (curr_exec_cnt / elapsed_sec) : 0;
+
+            dprintf(run->global->io.statsFileFd,
+                "%lu, %lu, %zu, %zu, %zu, %zu, %zu, %" PRIu64 ", %" PRIu64 ", %zu\n",
+                (unsigned long)curr_sec,                          /* unix_time */
+                (unsigned long)run->global->timing.lastCovUpdate, /* last_cov_update */
+                curr_exec_cnt,                                    /* total_exec */
+                tot_exec_per_sec,                                 /* exec_per_sec */
+                run->global->cnts.crashesCnt,                     /* crashes */
+                run->global->cnts.uniqueCrashesCnt,               /* unique_crashes */
+                run->global->cnts.timeoutedCnt,                   /* hangs */
+                run->global->feedback.hwCnts.softCntEdge,         /* edge_cov */
+                run->global->feedback.hwCnts.softCntPc,           /* block_cov */
+                run->global->io.dynfileqCnt                       /* corpus_count */
+            );
+        }
 
         /* Update per-input coverage metrics */
         run->dynfile->cov[0] = softCurEdge + softCurPC + run->hwCnts.bbCnt;
         run->dynfile->cov[1] = softCurCmp;
         run->dynfile->cov[2] = run->hwCnts.cpuInstrCnt + run->hwCnts.cpuBranchCnt;
         run->dynfile->cov[3] = run->dynfile->size ? (64 - util_Log2(run->dynfile->size)) : 64;
+
+        /* Track novelty - how many new edges this input discovered */
+        run->dynfile->newEdges = (uint32_t)(softNewEdge + softNewPC + run->hwCnts.newBBCnt);
+
+        /* Track mutation depth */
+        run->dynfile->depth = run->dynfile->src ? run->dynfile->src->depth + 1 : 0;
+        run->dynfile->stackDepth =
+            ATOMIC_GET(run->global->feedback.covFeedbackMap->pidLastStackDepth[run->fuzzNo].val);
+
+        /* Track execution path hash for diversity */
+        run->dynfile->pathHash =
+            ATOMIC_GET(run->global->feedback.covFeedbackMap->pidPathHash[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidPathHash[run->fuzzNo].val);
+
+        /* Track CMP progress for inputs making headway on comparisons */
+        run->dynfile->cmpProgress = (uint32_t)ATOMIC_GET(
+            run->global->feedback.covFeedbackMap->pidCmpProgress[run->fuzzNo].val);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidCmpProgress[run->fuzzNo].val);
+
+        /* Track rare edges - edges hit by few corpus entries */
+        run->dynfile->rareEdgeCnt = (uint16_t)HF_MIN(
+            ATOMIC_GET(run->global->feedback.covFeedbackMap->pidRareEdgeCnt[run->fuzzNo].val),
+            UINT16_MAX);
+        ATOMIC_CLEAR(run->global->feedback.covFeedbackMap->pidRareEdgeCnt[run->fuzzNo].val);
+
+        /* Credit mutation tiers that led to this coverage gain */
+        for (int tier = 0; tier < 4; tier++) {
+            if (run->mutationTiers & (1 << tier)) {
+                ATOMIC_POST_INC(run->global->mutate.stats[tier].successes);
+            }
+        }
+
+        /* Push useful imported input to dynamic queue again for the further mutations */
+        if (run->dynfile->imported) {
+            LOG_I("File imported: %s", run->dynfile->path);
+            run->dynfile->imported = false;
+        }
         input_addDynamicInput(run);
 
         if (run->global->socketFuzzer.enabled) {
             LOG_D("SocketFuzzer: fuzz: new BB (perf)");
             fuzz_notifySocketFuzzerNewCov(run->global);
         }
+    } else if (run->dynfile->imported) {
+        /* Remove useless imported inputs from corpus */
+        LOG_D("Removing useless imported file: %s", run->dynfile->path);
+        char fname[PATH_MAX];
+        snprintf(fname, PATH_MAX, "%s/%s",
+            run->global->io.outputDir ? run->global->io.outputDir : run->global->io.inputDir,
+            run->dynfile->path);
+        unlink(fname);
     }
 }
 
@@ -317,7 +413,7 @@ static bool fuzz_fetchInput(run_t* run) {
         fuzzState_t st = fuzz_getState(run->global);
         if (st == _HF_STATE_DYNAMIC_DRY_RUN) {
             run->mutationsPerRun = 0U;
-            if (input_prepareStaticFile(run, /* rewind= */ false, true)) {
+            if (input_prepareStaticFile(run, /* rewind= */ false, /* mangle= */ false)) {
                 return true;
             }
             fuzz_setDynamicMainState(run);
@@ -354,11 +450,11 @@ static bool fuzz_fetchInput(run_t* run) {
                 return false;
             }
         } else if (run->global->exe.feedbackMutateCommand) {
-            if (!input_prepareStaticFile(run, true, false)) {
+            if (!input_prepareStaticFile(run, /* rewind= */ true, /* mangle= */ false)) {
                 LOG_E("input_prepareStaticFile() failed");
                 return false;
             }
-        } else if (!input_prepareStaticFile(run, true /* rewind */, true)) {
+        } else if (!input_prepareStaticFile(run, /* rewind= */ true, /* mangle= */ true)) {
             LOG_E("input_prepareStaticFile() failed");
             return false;
         }
@@ -435,8 +531,8 @@ static void fuzz_fuzzLoopSocket(run_t* run) {
 
     LOG_I("------------------------------------------------------");
 
-    /* First iteration: Start target
-       Other iterations: re-start target, if necessary
+    /* First iteration - start target
+       Other iterations - re-start target, if necessary
        subproc_Run() will decide by itself if a restart is necessary, via
        subproc_New()
     */
@@ -487,6 +583,9 @@ static void* fuzz_threadNew(void* arg) {
         .fuzzNo         = fuzzNo,
         .persistentSock = -1,
         .tmOutSignaled  = false,
+    };
+    defer {
+        free(run.dynfile);
     };
 
     /* Do not try to handle input files with socketfuzzer */
@@ -552,6 +651,8 @@ static void* fuzz_threadNew(void* arg) {
             break;
         }
     }
+
+    arch_reapKill();
 
     if (run.pid) {
         kill(run.pid, SIGKILL);

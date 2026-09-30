@@ -2,13 +2,18 @@
 
 set -e
 
-version=${1:-2.5}
+# Upstream has not tagged a release since 2.6 (2023), which predates the GCC 15 and
+# binutils >= 2.39 build fixes, so track a pinned commit on master. Accepts a tag or commit.
+version=${1:-940b958dfeb6f9131fd846cae31fcc0fe996ae98}
 project_dir="$(pwd)"
 tmp_dir="$(mktemp -d)"
 honggfuzz_dir="$project_dir/honggfuzz/"
 
-git clone --depth 1 --single-branch --branch $version https://github.com/google/honggfuzz.git "$tmp_dir"
+git clone --quiet https://github.com/google/honggfuzz.git "$tmp_dir"
+git -C "$tmp_dir" checkout --quiet "$version"
+revision="$(git -C "$tmp_dir" rev-parse HEAD)"
 rm -rf "$honggfuzz_dir"
+mkdir -p "$honggfuzz_dir"
 mv "$tmp_dir/android/" "$honggfuzz_dir"
 mv "$tmp_dir/includes/" "$honggfuzz_dir"
 mv "$tmp_dir/libhfcommon/" "$honggfuzz_dir"
@@ -23,6 +28,7 @@ mv "$tmp_dir/COPYING" "$honggfuzz_dir"
 mv "$tmp_dir/Makefile" "$honggfuzz_dir"
 mv "$tmp_dir"/*.c "$honggfuzz_dir"
 mv "$tmp_dir"/*.h "$honggfuzz_dir"
+echo "$revision" > "$honggfuzz_dir/REVISION"
 
 function replace() {
     sed -i.bak -e "$1" "$2"
@@ -36,14 +42,11 @@ do
     replace "s/int main/int ${name}_main/" $f
 done
 
-# NOTE: the vendored 2.5 sources carry backports of upstream fixes that no tagged release
-# includes yet. Re-apply them when re-vendoring a version that predates these commits:
-#   - mangle.c: 4cfa62f4fd ("mangle: support gcc-15 with __attribute__((nonstring))"),
-#     or GCC 15+ fails the -Werror build.
-#   - linux/bfd.c: the disassembler()/init_disassemble_info() prototype detection from
-#     de82cde506 and its predecessors, and the `== TRUE` removal from cdefacd313, or the
-#     build fails against binutils >= 2.39.
-
 replace "s/return EXIT_SUCCESS/return hfuzz->cnts.crashesCnt > 0 ? EXIT_FAILURE : EXIT_SUCCESS/" $project_dir/honggfuzz/honggfuzz.c
 
-echo -e "libhonggfuzz.a: \$(OBJS) \$(LCOMMON_ARCH) \$(CRASH_REPORT)\n\t\$(AR) rcs libhonggfuzz.a \$(OBJS) \$(CRASH_REPORT)" >> "$project_dir/honggfuzz/Makefile"
+# build the fuzzer itself as a static library so cargo-bolero can link it and call honggfuzz_main
+cat >> "$project_dir/honggfuzz/Makefile" <<'MAKEFILE'
+
+$(_OBJDIR)/libhonggfuzz.a: $(OBJS) $(LCOMMON_ARCH) | $$(dir $$@)
+	$(AR) rcs $@ $(OBJS)
+MAKEFILE

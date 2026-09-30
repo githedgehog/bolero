@@ -102,7 +102,7 @@ static pid_t sanitizers_PidForTid(pid_t pid) {
     char status_path[PATH_MAX];
     snprintf(status_path, sizeof(status_path), "/proc/%d/status", (int)pid);
     FILE* f = fopen(status_path, "rb");
-    if (!f) {
+    if (UNLIKELY(!f)) {
         return pid;
     }
     defer {
@@ -173,13 +173,30 @@ size_t sanitizers_parseReport(run_t* run, pid_t pid, funcs_t* funcs, uint64_t* p
                 break;
             }
             headerFound = true;
-            sscanf(lineptr,
+
+            /* Extract the error description */
+            sscanf(lineptr, "==%*d==ERROR: %" HF_XSTR(HF_STR_LEN_MINUS_1) "[^\n]", description);
+
+            /* Extract the crash address and PC. First try the standard "on address" format
+             */
+            int mathchCount = sscanf(lineptr,
                 "==%*d==ERROR: %*[^:]: %*[^ ] on address 0x%" PRIx64 " at pc 0x%" PRIx64, crashAddr,
                 pc);
-            sscanf(lineptr,
-                "==%*d==ERROR: %*[^:]: %*[^ ] on %*s address 0x%" PRIx64 " (pc 0x%" PRIx64,
-                crashAddr, pc);
-            sscanf(lineptr, "==%*d==ERROR: %" HF_XSTR(HF_STR_LEN_MINUS_1) "[^\n]", description);
+
+            if (mathchCount != 2) {
+                /* If we cannot match report headers with "on address", try the format with a descriptor before "address" */
+                char addressDetail[HF_STR_LEN] = {0};
+                if (sscanf(lineptr,
+                        "==%*d==ERROR: %*[^:]: %*[^ ] on %" HF_XSTR(
+                            HF_STR_LEN_MINUS_1) "s address 0x%" PRIx64 " (pc 0x%" PRIx64,
+                        addressDetail, crashAddr, pc) == 3) {
+                    /* If the address descriptor is "unknown", set crashAddr to 0 as this would
+                     * break error deduplication*/
+                    if (strncmp(addressDetail, "unknown", 7) == 0) {
+                        *crashAddr = 0;
+                    }
+                }
+            }
         } else {
             char* pLineLC = lineptr;
             /* Trim leading spaces */

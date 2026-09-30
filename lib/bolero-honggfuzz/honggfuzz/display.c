@@ -114,7 +114,7 @@ static unsigned getCpuUse(int numCpus) {
 
 #if defined(__linux__) || defined(__CYGWIN__)
     FILE* f = fopen("/proc/stat", "re");
-    if (f == NULL) {
+    if (UNLIKELY(f == NULL)) {
         return 0;
     }
     defer {
@@ -130,7 +130,7 @@ static unsigned getCpuUse(int numCpus) {
     long   off        = 0;
     size_t cpuDataLen = sizeof(long) * CPUSTATES * numCpus;
     long*  cpuData    = malloc(cpuDataLen);
-    if (cpuData == NULL) {
+    if (UNLIKELY(cpuData == NULL)) {
         return 0;
     }
 
@@ -233,7 +233,7 @@ static unsigned getCpuUse(int numCpus) {
     prevIdleT   = idleT;
 
     uint64_t allCycles = userCycles + niceCycles + systemCycles + idleCycles;
-    if (allCycles == 0) {
+    if (UNLIKELY(allCycles == 0)) {
         return 0;
     }
 
@@ -330,29 +330,29 @@ void display_display(honggfuzz_t* hfuzz) {
             hfuzz->mutate.mutationsMax, exeProgress);
     }
     switch (ATOMIC_GET(hfuzz->feedback.state)) {
-        case _HF_STATE_STATIC:
-            display_put("\n        Mode : " ESC_BOLD "Static" ESC_RESET "\n");
-            break;
-        case _HF_STATE_DYNAMIC_DRY_RUN: {
-            if (ATOMIC_GET(hfuzz->cfg.switchingToFDM)) {
-                display_put("\n  Mode [2/3] : " ESC_BOLD
-                            "Switching to the Feedback Driven Mode" ESC_RESET " [%zu/%zu]\n",
-                    hfuzz->io.testedFileCnt, hfuzz->io.fileCnt);
-            } else {
-                display_put("\n  Mode [1/3] : " ESC_BOLD "Feedback Driven Dry Run" ESC_RESET
-                            " [%zu/%zu]\n",
-                    hfuzz->io.testedFileCnt, hfuzz->io.fileCnt);
-            }
-        } break;
-        case _HF_STATE_DYNAMIC_MAIN:
-            display_put("\n  Mode [3/3] : " ESC_BOLD "Feedback Driven Mode" ESC_RESET "\n");
-            break;
-        case _HF_STATE_DYNAMIC_MINIMIZE:
-            display_put("\n  Mode [3/3] : " ESC_BOLD "Corpus Minimization" ESC_RESET "\n");
-            break;
-        default:
-            display_put("\n        Mode : " ESC_BOLD "Unknown" ESC_RESET "\n");
-            break;
+    case _HF_STATE_STATIC:
+        display_put("\n        Mode : " ESC_BOLD "Static" ESC_RESET "\n");
+        break;
+    case _HF_STATE_DYNAMIC_DRY_RUN: {
+        if (ATOMIC_GET(hfuzz->cfg.switchingToFDM)) {
+            display_put("\n  Mode [2/3] : " ESC_BOLD
+                        "Switching to the Feedback Driven Mode" ESC_RESET " [%zu/%zu]\n",
+                hfuzz->io.testedFileCnt, hfuzz->io.fileCnt);
+        } else {
+            display_put("\n  Mode [1/3] : " ESC_BOLD "Feedback Driven Dry Run" ESC_RESET
+                        " [%zu/%zu]\n",
+                hfuzz->io.testedFileCnt, hfuzz->io.fileCnt);
+        }
+    } break;
+    case _HF_STATE_DYNAMIC_MAIN:
+        display_put("\n  Mode [3/3] : " ESC_BOLD "Feedback Driven Mode" ESC_RESET "\n");
+        break;
+    case _HF_STATE_DYNAMIC_MINIMIZE:
+        display_put("\n  Mode [3/3] : " ESC_BOLD "Corpus Minimization" ESC_RESET "\n");
+        break;
+    default:
+        display_put("\n        Mode : " ESC_BOLD "Unknown" ESC_RESET "\n");
+        break;
     }
     display_put("      Target : " ESC_BOLD "%s" ESC_RESET "\n", hfuzz->display.cmdline_txt);
 
@@ -417,10 +417,28 @@ void display_display(honggfuzz_t* hfuzz) {
         uint64_t softCntCmp  = ATOMIC_GET(hfuzz->feedback.hwCnts.softCntCmp);
         uint64_t guardNb     = ATOMIC_GET(hfuzz->feedback.covFeedbackMap->guardNb);
         display_put(" edge: " ESC_BOLD "%" _HF_NONMON_SEP PRIu64 ESC_RESET "/"
-                    "%" _HF_NONMON_SEP                           PRIu64 " [%" PRId64 "%%]",
+                    "%" _HF_NONMON_SEP PRIu64 " [%" PRId64 "%%]",
             softCntEdge, guardNb, guardNb ? ((softCntEdge * 100) / guardNb) : 0);
         display_put(" pc: " ESC_BOLD "%" _HF_NONMON_SEP PRIu64 ESC_RESET, softCntPc);
         display_put(" cmp: " ESC_BOLD "%" _HF_NONMON_SEP PRIu64 ESC_RESET, softCntCmp);
+        /* Find max stack depth across all threads */
+        size_t maxDepth = 0;
+        for (size_t i = 0; i < hfuzz->threads.threadsMax; i++) {
+            size_t depth = ATOMIC_GET(hfuzz->feedback.covFeedbackMap->maxStackDepth[i].val);
+            if (depth > maxDepth) {
+                maxDepth = depth;
+            }
+        }
+        if (maxDepth > 0) {
+            if (maxDepth >= 1024 * 1024) {
+                display_put(
+                    " stk: " ESC_BOLD "%.2lf " ESC_RESET " MB", (double)maxDepth / (1024 * 1024));
+            } else if (maxDepth >= 1024) {
+                display_put(" stk: " ESC_BOLD "%.2lf" ESC_RESET " kB", (double)maxDepth / 1024);
+            } else {
+                display_put(" stk: " ESC_BOLD "%zu" ESC_RESET " B", maxDepth);
+            }
+        }
     }
 
     display_put("\n---------------------------------- [ " ESC_BOLD "LOGS" ESC_RESET
