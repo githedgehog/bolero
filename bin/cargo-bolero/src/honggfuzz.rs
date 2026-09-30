@@ -60,7 +60,7 @@ pub(crate) fn test(selection: &Selection, test_args: &test::Args) -> Result<()> 
         "1".to_string(),
     ];
 
-    optional_arg!(args, "--run_timeout", test_args.time_as_secs());
+    optional_arg!(args, "--run_time", test_args.time_as_secs());
     optional_arg!(args, "--iterations", test_args.runs);
     optional_arg!(args, "--threads", test_args.jobs);
     optional_arg!(args, "--max_file_size", test_args.max_input_length);
